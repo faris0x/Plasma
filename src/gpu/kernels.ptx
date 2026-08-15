@@ -1,0 +1,479 @@
+// Copyright (c) 2026 Faris Alfarhan
+// SPDX-License-Identifier: GPL-3.0-only
+
+//
+// Plasma GPU kernel library - hand-written PTX.
+//
+// Statevector layout: N = 2^n complex amplitudes, interleaved float2:
+//   index i -> s[2i]   = real part
+//   index i -> s[2i+1] = imaginary part
+//
+// Loaded through the CUDA driver API (cuModuleLoadData). The driver's
+// PTX JIT (libnvidia-ptxjitcompiler) compiles this to SASS for the actual
+// GPU, so no CUDA C, no nvcc, and no toolkit ships on the target.
+//
+// All kernels are 1-D grid-stride loops, one thread per index i.
+// PTX special registers (%tid.x etc.) are moved into regular registers
+// before arithmetic, per the PTX ISA rules.
+//
+
+.version 8.6
+.target sm_80
+.address_size 64
+
+// --- reset: |0..0> ---------------------------------------------------
+.visible .entry reset(
+    .param .u64 s,
+    .param .u32 N
+)
+{
+    .reg .u64 %ptr, %addr, %a64;
+    .reg .u32 %n, %gtid, %total, %off;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .f32 %one, %zero;
+    .reg .pred %p;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+    mov.f32 %one, 1.0;
+    mov.f32 %zero, 0.0;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+
+    mul.wide.u32 %a64, %gtid, 8;
+    add.u64 %addr, %ptr, %a64;
+
+    setp.eq.u32 %p, %gtid, 0;
+    @%p bra $is0;
+    st.global.f32 [%addr], %zero;
+    st.global.f32 [%addr+4], %zero;
+    bra $next;
+$is0:
+    st.global.f32 [%addr], %one;
+    st.global.f32 [%addr+4], %zero;
+
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+// --- apply_h: Hadamard butterfly on qubit q ------------------------
+.visible .entry apply_h(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 q
+)
+{
+    .reg .u64 %ptr, %addr_i, %addr_j, %a64;
+    .reg .u32 %n, %gtid, %total, %bit, %q, %one, %off, %i, %j;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .f32 %re_i, %im_i, %re_j, %im_j;
+    .reg .f32 %nr_i, %ni_i, %nr_j, %ni_j;
+    .reg .f32 %inv;
+    .reg .pred %p;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %q, [q];
+
+    mov.u32 %one, 1;
+    shl.b32 %bit, %one, %q;
+    mov.f32 %inv, 0.7071067811865476;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+
+    and.b32 %off, %gtid, %bit;
+    setp.eq.u32 %p, %off, 0;
+    @!%p bra $next;              // high member: handled by its partner
+
+    mov.u32 %i, %gtid;
+    or.b32 %j, %i, %bit;
+
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    mul.wide.u32 %a64, %j, 8;
+    add.u64 %addr_j, %ptr, %a64;
+
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    ld.global.f32 %re_j, [%addr_j];
+    ld.global.f32 %im_j, [%addr_j+4];
+
+    add.f32 %nr_i, %re_i, %re_j;
+    mul.f32 %nr_i, %nr_i, %inv;
+    add.f32 %ni_i, %im_i, %im_j;
+    mul.f32 %ni_i, %ni_i, %inv;
+    sub.f32 %nr_j, %re_i, %re_j;
+    mul.f32 %nr_j, %nr_j, %inv;
+    sub.f32 %ni_j, %im_i, %im_j;
+    mul.f32 %ni_j, %ni_j, %inv;
+
+    st.global.f32 [%addr_i], %nr_i;
+    st.global.f32 [%addr_i+4], %ni_i;
+    st.global.f32 [%addr_j], %nr_j;
+    st.global.f32 [%addr_j+4], %ni_j;
+
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+// --- apply_x: swap amplitude pairs on qubit q ------------------------
+.visible .entry apply_x(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 q
+)
+{
+    .reg .u64 %ptr, %addr_i, %addr_j, %a64;
+    .reg .u32 %n, %gtid, %total, %bit, %q, %one, %off, %i, %j;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .f32 %re_i, %im_i, %re_j, %im_j;
+    .reg .pred %p;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %q, [q];
+
+    mov.u32 %one, 1;
+    shl.b32 %bit, %one, %q;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+
+    and.b32 %off, %gtid, %bit;
+    setp.eq.u32 %p, %off, 0;
+    @!%p bra $next;
+
+    mov.u32 %i, %gtid;
+    or.b32 %j, %i, %bit;
+
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    mul.wide.u32 %a64, %j, 8;
+    add.u64 %addr_j, %ptr, %a64;
+
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    ld.global.f32 %re_j, [%addr_j];
+    ld.global.f32 %im_j, [%addr_j+4];
+
+    st.global.f32 [%addr_i], %re_j;
+    st.global.f32 [%addr_i+4], %im_j;
+    st.global.f32 [%addr_j], %re_i;
+    st.global.f32 [%addr_j+4], %im_i;
+
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+// --- apply_cnot: swap pairs on target t when control c is set ------
+.visible .entry apply_cnot(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 c,
+    .param .u32 t
+)
+{
+    .reg .u64 %ptr, %addr_i, %addr_j, %a64;
+    .reg .u32 %n, %gtid, %total, %cbit, %tbit, %one, %off, %i, %j;
+    .reg .u32 %c, %t;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .f32 %re_i, %im_i, %re_j, %im_j;
+    .reg .pred %p;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %c, [c];
+    ld.param.u32 %t, [t];
+
+    mov.u32 %one, 1;
+    shl.b32 %cbit, %one, %c;
+    mov.u32 %one, 1;
+    shl.b32 %tbit, %one, %t;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+
+    and.b32 %off, %gtid, %tbit;
+    setp.eq.u32 %p, %off, 0;
+    @!%p bra $next;
+
+    mov.u32 %i, %gtid;
+    and.b32 %off, %i, %cbit;
+    setp.eq.u32 %p, %off, %cbit;
+    @!%p bra $next;
+
+    or.b32 %j, %i, %tbit;
+
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    mul.wide.u32 %a64, %j, 8;
+    add.u64 %addr_j, %ptr, %a64;
+
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    ld.global.f32 %re_j, [%addr_j];
+    ld.global.f32 %im_j, [%addr_j+4];
+
+    st.global.f32 [%addr_i], %re_j;
+    st.global.f32 [%addr_i+4], %im_j;
+    st.global.f32 [%addr_j], %re_i;
+    st.global.f32 [%addr_j+4], %im_i;
+
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+// --- apply_toff: swap pairs on target t when c1 and c2 are set ---
+.visible .entry apply_toff(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 c1,
+    .param .u32 c2,
+    .param .u32 t
+)
+{
+    .reg .u64 %ptr, %addr_i, %addr_j, %a64;
+    .reg .u32 %n, %gtid, %total, %c1bit, %c2bit, %tbit, %one, %off, %i, %j;
+    .reg .u32 %c1, %c2, %t;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .f32 %re_i, %im_i, %re_j, %im_j;
+    .reg .pred %p;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %c1, [c1];
+    ld.param.u32 %c2, [c2];
+    ld.param.u32 %t, [t];
+
+    mov.u32 %one, 1;
+    shl.b32 %c1bit, %one, %c1;
+    mov.u32 %one, 1;
+    shl.b32 %c2bit, %one, %c2;
+    mov.u32 %one, 1;
+    shl.b32 %tbit, %one, %t;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+
+    and.b32 %off, %gtid, %tbit;
+    setp.eq.u32 %p, %off, 0;
+    @!%p bra $next;
+
+    mov.u32 %i, %gtid;
+    and.b32 %off, %i, %c1bit;
+    setp.eq.u32 %p, %off, %c1bit;
+    @!%p bra $next;
+    and.b32 %off, %i, %c2bit;
+    setp.eq.u32 %p, %off, %c2bit;
+    @!%p bra $next;
+
+    or.b32 %j, %i, %tbit;
+
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    mul.wide.u32 %a64, %j, 8;
+    add.u64 %addr_j, %ptr, %a64;
+
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    ld.global.f32 %re_j, [%addr_j];
+    ld.global.f32 %im_j, [%addr_j+4];
+
+    st.global.f32 [%addr_i], %re_j;
+    st.global.f32 [%addr_i+4], %im_j;
+    st.global.f32 [%addr_j], %re_i;
+    st.global.f32 [%addr_j+4], %im_i;
+
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+// --- prob: P(qubit q = 1) into out[0] ------------------------------
+.visible .entry prob(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 q,
+    .param .u64 out
+)
+{
+    .reg .u64 %ptr, %outptr, %addr, %a64;
+    .reg .u32 %n, %gtid, %total, %bit, %q, %one, %off;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .f32 %re, %im, %acc, %tmp;
+    .reg .pred %p;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %q, [q];
+    ld.param.u64 %outptr, [out];
+
+    mov.u32 %one, 1;
+    shl.b32 %bit, %one, %q;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+    mov.f32 %acc, 0.0;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $reduce;
+
+    and.b32 %off, %gtid, %bit;
+    setp.eq.u32 %p, %off, 0;
+    @%p bra $next;
+
+    mul.wide.u32 %a64, %gtid, 8;
+    add.u64 %addr, %ptr, %a64;
+    ld.global.f32 %re, [%addr];
+    ld.global.f32 %im, [%addr+4];
+    mul.f32 %tmp, %re, %re;
+    add.f32 %acc, %acc, %tmp;
+    mul.f32 %tmp, %im, %im;
+    add.f32 %acc, %acc, %tmp;
+
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+
+$reduce:
+    atom.global.add.f32 %tmp, [%outptr], %acc;
+    ret;
+}
+
+// --- collapse: keep branch `outcome`, renormalise by inv_norm ------
+.visible .entry collapse(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 q,
+    .param .u32 outcome,
+    .param .f32 inv_norm
+)
+{
+    .reg .u64 %ptr, %addr, %a64;
+    .reg .u32 %n, %gtid, %total, %q, %one, %outcome, %off;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .f32 %re, %im, %zero, %inv;
+    .reg .pred %p;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %q, [q];
+    ld.param.u32 %outcome, [outcome];
+    ld.param.f32 %inv, [inv_norm];
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+    mov.f32 %zero, 0.0;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+
+    mul.wide.u32 %a64, %gtid, 8;
+    add.u64 %addr, %ptr, %a64;
+
+    shr.u32 %off, %gtid, %q;
+    and.b32 %off, %off, 1;
+    setp.eq.u32 %p, %off, %outcome;
+    @!%p bra $zero;
+
+    ld.global.f32 %re, [%addr];
+    ld.global.f32 %im, [%addr+4];
+    mul.f32 %re, %re, %inv;
+    mul.f32 %im, %im, %inv;
+    st.global.f32 [%addr], %re;
+    st.global.f32 [%addr+4], %im;
+    bra $next;
+
+$zero:
+    st.global.f32 [%addr], %zero;
+    st.global.f32 [%addr+4], %zero;
+
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
