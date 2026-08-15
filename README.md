@@ -35,7 +35,8 @@ PRINT
 ```
 
 Gates: `H`, `X`, `CNOT`, `TOFF`. Control flow: `MEASURE`, `IF`/`ENDIF`,
-`SHOT`/`ENDSHOT`, `PRINT`, `END`/`HALT`. See `SPEC.md` for the full semantics.
+`SHOT`/`ENDSHOT`, `PRINT`, `END`/`HALT`. See [SPEC.md](SPEC.md) for the full
+semantics.
 
 ## Backends
 
