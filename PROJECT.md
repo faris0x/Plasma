@@ -101,7 +101,7 @@ and B). This section describes how the machinery upholds them.
 `sin`, `cos`, `round`, `floor`, `trunc`, `rem_euclid` are all gated out
 (only `abs`, casts, and bit operations are available). The math in
 `src/math.rs` is therefore deterministic and heap-free:
-faithful f64 ports of the algorithms in the author's
+faithful f64 ports of the algorithms in my
 [NumCore](https://github.com/NumCore/NumCore/tree/main/numcore/src/math) firmware. They are self-contained copies
 (algorithm, not a dependency), keeping Plasma and planckOS independent:
 
