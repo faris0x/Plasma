@@ -1,0 +1,25 @@
+// v0.2 subroutines: jump-based GATE definitions + parameterized calls,
+// including a nested call (ghz calls bell) and an IF inside a gate body.
+QUBITS 4
+GATE bell 2
+H 0
+CNOT 0 1
+ENDGATE
+GATE ghz 1
+bell 0 1
+bell 1 2
+bell 2 3
+ENDGATE
+GATE cnot_if 2
+CNOT 0 1
+IF c0 == 1 THEN
+H 0
+ENDIF
+ENDGATE
+SET c0 1
+ghz 0
+cnot_if 1 2
+EXPECT Z0Z1Z2Z3
+EXPECT X0Y1X2Z3
+SHOT 5000
+PRINT

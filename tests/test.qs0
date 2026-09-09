@@ -1,0 +1,19 @@
+QUBITS 3                  // 3 qubits (q0, q1, q2) and 3 classical bits (c0, c1, c2)
+
+H 0                       // Put q0 into superposition: (|0> + |1>)/√2
+X 1                       // Flip q1 from |0> to |1>
+CNOT 0 1                  // Entangle q0 and q1: if q0=1, flip q1 → state becomes (|01> + |10>)/√2
+TOFF 0 1 2                // Toffoli: flip q2 ONLY if q0=1 AND q1=1. 
+                          // In our state, q0 and q1 are never both 1, so q2 stays |0>.
+
+MEASURE 0 -> c0           // Measure q0 → classical bit c0
+MEASURE 1 -> c1           // Measure q1 → classical bit c1
+MEASURE 2 -> c2           // Measure q2 → classical bit c2
+
+IF c0 == 1 THEN           // If q0 was measured as 1, flip q0 again (just for demo)
+  X 0
+ENDIF
+
+SHOT 10000                // Run the entire circuit 100 times
+PRINT                     // Print the measurement histogram
+END                       // Terminate

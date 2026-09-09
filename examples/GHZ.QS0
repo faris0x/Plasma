@@ -1,0 +1,32 @@
+// GHZ.QS0 - a three-qubit Greenberger-Horne-Zeilinger state.
+//
+// Demonstrates: superposition, entanglement, measurement correlation,
+// and the stabilizer engine.
+//
+// Qubit-level explanation:
+//   Start in |000>.
+//   H 0      puts qubit 0 into the equal superposition (|0>+|1>)/sqrt2,
+//            so the state becomes (|000>+|100>)/sqrt2.
+//   CNOT 0 1 entangles qubit 1 with qubit 0: |000> stays, |100> -> |110>,
+//            giving (|000>+|110>)/sqrt2.
+//   CNOT 1 2 entangles qubit 2 with qubit 1, giving the GHZ state
+//            (|000>+|111>)/sqrt2.
+//
+// Measuring every qubit always yields all-zero or all-one. The histogram is
+// a 50/50 split between |000> and |111> with no mixed outcomes, which is a
+// direct test of multi-partite entanglement: the three measurement results
+// are perfectly correlated even though each individual qubit is maximally
+// mixed.
+//
+// Run (all give the same 50/50 split):
+//   plasma run examples/GHZ.QS0 --shots 1000
+//   plasma run examples/GHZ.QS0 --gpu --shots 1000
+//   plasma run examples/GHZ.QS0 --stabilizer --shots 1000
+// The stabilizer engine handles this Clifford circuit exactly.
+QUBITS 3
+H 0
+CNOT 0 1
+CNOT 1 2
+SHOT 1000
+PRINT
+END

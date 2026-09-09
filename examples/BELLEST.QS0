@@ -1,0 +1,35 @@
+// BELLEST.QS0 - a Bell state, verified through the Hamiltonian estimator.
+//
+// Demonstrates: the ESTIMATE operator, expectation values, entanglement.
+//
+// Qubit-level explanation:
+//   H 0 creates (|00>+|10>)/sqrt2; CNOT 0 1 turns it into the Bell state
+//   (|00>+|11>)/sqrt2 on qubits 0 and 1. For this state the two-qubit
+//   correlators are:
+//       <Z0 Z1> =  1     (Z measurements of the two qubits always agree)
+//       <X0 X1> =  1     (the same holds in the X basis)
+//       <Y0 Y1> = -1     (but they are opposite in the Y basis)
+//   That pattern is the signature of a maximally entangled pair: it cannot
+//   be produced by any product state.
+//
+//   ESTIMATE evaluates a weighted sum of Pauli expectations directly from
+//   the amplitudes, with no sampling, so each estimate[i] is exact up to f64
+//   rounding:
+//       estimate[0] = 1.0*<Z0 Z1> =  1.0
+//       estimate[1] = 1.0*<X0 X1> =  1.0
+//       estimate[2] = 1.0*<Y0 Y1> = -1.0
+//   Combining them gives a Hamiltonian expectation such as
+//   <Z0Z1> + <X0X1> - <Y0Y1> = 3, the maximal violation value for a Bell
+//   inequality.
+//
+// Run:
+//   plasma run examples/BELLEST.QS0
+//   plasma run examples/BELLEST.QS0 --gpu
+QUBITS 2
+H 0
+CNOT 0 1
+ESTIMATE 1.0 Z0Z1
+ESTIMATE 1.0 X0X1
+ESTIMATE 1.0 Y0Y1
+PRINT
+END

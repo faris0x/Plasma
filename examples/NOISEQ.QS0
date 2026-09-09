@@ -1,0 +1,38 @@
+// NOISEQ.QS0 - how noise distorts a circuit, and readout mitigation.
+//
+// Demonstrates: the sampled-Kraus noise models (--noise-*) and readout
+// mitigation (--mitigate-readout).
+//
+// Qubit-level explanation:
+//   The circuit prepares the Bell state (|00>+|11>)/sqrt2, so an ideal run
+//   reports exactly 50/50 |00> and |11>. The explicit MEASURE ops are what
+//   the noise models act on: readout error perturbs the reported outcome of
+//   a MEASURE, while depolarizing error applies a random Pauli after every
+//   single-qubit gate.
+//
+//   --noise-depolarizing 0.05 breaks the perfect correlation: after H 0 a
+//   random Pauli acts on qubit 0 with probability 0.05, so the histogram
+//   gains |01> and |10> counts.
+//
+//   --noise-readout 0.1 makes each MEASURE mis-report its outcome with
+//   probability 0.1, tilting the |00>/|11> ratio.
+//
+//   --mitigate-readout inverts the per-qubit confusion matrix to estimate
+//   the ideal counts from the noisy histogram. It is an estimator, so the
+//   recovered counts can differ slightly from the shot total.
+//
+//   Noise runs on the CPU reference path only (deterministic per seed).
+//
+// Run:
+//   plasma run examples/NOISEQ.QS0 --shots 1000                     (ideal)
+//   plasma run examples/NOISEQ.QS0 --noise-depolarizing 0.05 --shots 1000
+//   plasma run examples/NOISEQ.QS0 --noise-readout 0.1 --shots 1000
+//   plasma run examples/NOISEQ.QS0 --noise-readout 0.1 --mitigate-readout --shots 1000
+QUBITS 2
+H 0
+CNOT 0 1
+MEASURE 0 -> c0
+MEASURE 1 -> c1
+SHOT 1000
+PRINT
+END

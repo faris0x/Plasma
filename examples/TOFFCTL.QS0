@@ -1,0 +1,40 @@
+// TOFFCTL.QS0 - multi-qubit controlled gates and classical control.
+//
+// Demonstrates: TOFF (Toffoli), MCX (multi-controlled-X), CSWAP (Fredkin),
+// and IF-driven gates.
+//
+// Qubit-level explanation:
+//   X 0, X 1 set the controls of the three-qubit gates. Then:
+//     TOFF 0 1 2    flips qubit 2 iff qubits 0 and 1 are both |1>. They are,
+//                   so qubit 2 becomes |1>.
+//     MCX 7 3       is an X on qubit 3 controlled by every bit set in the
+//                   mask 7 = 0b111, i.e. qubits 0, 1 and 2. All three are
+//                   now |1>, so qubit 3 flips to |1>.
+//     X 4, X 5      set the Fredkin control and one of the swapped qubits.
+//     CSWAP 4 5 6   swaps qubits 5 and 6 iff qubit 4 is |1>. Since it is,
+//                   the |1> moves from qubit 5 to qubit 6.
+//   Finally MEASURE 0 writes the deterministic outcome 1 into c0, and the
+//   IF block flips qubit 1 back to |0>.
+//
+//   Every step is deterministic (no superpositions are created), so all 1000
+//   shots report the single final state. The histogram is printed in the
+//   |q6 q5 q4 q3 q2 q1 q0> ordering, giving |1011101> (q6=1, q5=0, q4=1,
+//   q3=1, q2=1, q1=0, q0=1).
+//
+// Run:
+//   plasma run examples/TOFFCTL.QS0 --shots 1000
+QUBITS 7
+X 0
+X 1
+TOFF 0 1 2
+MCX 7 3
+X 4
+X 5
+CSWAP 4 5 6
+MEASURE 0 -> c0
+IF c0 == 1 THEN
+  X 1
+ENDIF
+SHOT 1000
+PRINT
+END

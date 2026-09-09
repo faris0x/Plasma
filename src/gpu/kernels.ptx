@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 //
-// Plasma GPU kernel library - hand-written PTX.
+// Plasma GPU kernel library.
 //
 // Statevector layout: N = 2^n complex amplitudes, interleaved float2:
 //   index i -> s[2i]   = real part
@@ -21,7 +21,15 @@
 .target sm_80
 .address_size 64
 
-// --- reset: |0..0> ---------------------------------------------------
+// Dynamic shared memory for the mega kernel.
+.extern .shared .align 4 .b32 smem[];
+
+// Deterministic-reduction scratch: each block stores its per-thread partials
+// (256 threads) and thread 0 sums them in thread-index order.
+.shared .align 4 .b32 sdata_prob[512];
+.shared .align 4 .b32 sdata_final[256];
+
+// reset: |0..0>
 .visible .entry reset(
     .param .u64 s,
     .param .u32 N
@@ -71,7 +79,7 @@ $done:
     ret;
 }
 
-// --- apply_h: Hadamard butterfly on qubit q ------------------------
+// apply_h: Hadamard butterfly on qubit q
 .visible .entry apply_h(
     .param .u64 s,
     .param .u32 N,
@@ -145,7 +153,7 @@ $done:
     ret;
 }
 
-// --- apply_x: swap amplitude pairs on qubit q ------------------------
+// apply_x: swap amplitude pairs on qubit q
 .visible .entry apply_x(
     .param .u64 s,
     .param .u32 N,
@@ -207,7 +215,7 @@ $done:
     ret;
 }
 
-// --- apply_cnot: swap pairs on target t when control c is set ------
+// apply_cnot: swap pairs on target t when control c is set
 .visible .entry apply_cnot(
     .param .u64 s,
     .param .u32 N,
@@ -278,7 +286,7 @@ $done:
     ret;
 }
 
-// --- apply_toff: swap pairs on target t when c1 and c2 are set ---
+// apply_toff: swap pairs on target t when c1 and c2 are set
 .visible .entry apply_toff(
     .param .u64 s,
     .param .u32 N,
@@ -356,24 +364,30 @@ $done:
     ret;
 }
 
-// --- prob: P(qubit q = 1) into out[0] ------------------------------
-.visible .entry prob(
+// prob_partial: per-block partial sums of P(qubit q = 1)
+// Deterministic two-stage reduction with COMPENSATED (Kahan/Neumaier)
+// summation: each thread accumulates its |amp|^2 terms into a (hi, lo) pair,
+// thread 0 re-accumulates the block's pairs in thread-index order, and each
+// block writes its (hi, lo) partial to scratch[2*b]/scratch[2*b+1].
+// Compensation removes the O(sqrt(n)) f32 summation drift, which would
+// otherwise be ~1e-3 relative on 2^28-term sums.
+.visible .entry prob_partial(
     .param .u64 s,
     .param .u32 N,
     .param .u32 q,
-    .param .u64 out
+    .param .u64 scratch
 )
 {
-    .reg .u64 %ptr, %outptr, %addr, %a64;
+    .reg .u64 %ptr, %scrptr, %addr, %a64, %saddr, %sbase;
     .reg .u32 %n, %gtid, %total, %bit, %q, %one, %off;
     .reg .u32 %blk, %bdx, %tix, %gdx;
-    .reg .f32 %re, %im, %acc, %tmp;
+    .reg .f32 %re, %im, %tmp, %chi, %clo, %y, %sum;
     .reg .pred %p;
 
     ld.param.u64 %ptr, [s];
     ld.param.u32 %n, [N];
     ld.param.u32 %q, [q];
-    ld.param.u64 %outptr, [out];
+    ld.param.u64 %scrptr, [scratch];
 
     mov.u32 %one, 1;
     shl.b32 %bit, %one, %q;
@@ -387,7 +401,8 @@ $done:
     mov.u32 %total, %gdx;
     mul.lo.u32 %total, %total, %bdx;
 
-    mov.f32 %acc, 0.0;
+    mov.f32 %chi, 0.0;
+    mov.f32 %clo, 0.0;
 
 $loop:
     setp.ge.u32 %p, %gtid, %n;
@@ -402,20 +417,155 @@ $loop:
     ld.global.f32 %re, [%addr];
     ld.global.f32 %im, [%addr+4];
     mul.f32 %tmp, %re, %re;
-    add.f32 %acc, %acc, %tmp;
-    mul.f32 %tmp, %im, %im;
-    add.f32 %acc, %acc, %tmp;
+    mul.f32 %im, %im, %im;
+    add.f32 %tmp, %tmp, %im;
+    // Kahan: y = t - clo; sum = chi + y; clo = (sum - chi) - y; chi = sum
+    sub.f32 %y, %tmp, %clo;
+    add.f32 %sum, %chi, %y;
+    sub.f32 %clo, %sum, %chi;
+    sub.f32 %clo, %clo, %y;
+    mov.f32 %chi, %sum;
 
 $next:
     add.u32 %gtid, %gtid, %total;
     bra $loop;
 
 $reduce:
-    atom.global.add.f32 %tmp, [%outptr], %acc;
+    mov.u64 %sbase, sdata_prob;
+    mul.wide.u32 %a64, %tix, 8;
+    add.u64 %saddr, %sbase, %a64;
+    st.shared.f32 [%saddr], %chi;
+    st.shared.f32 [%saddr+4], %clo;
+    bar.sync 0;
+
+    setp.ne.u32 %p, %tix, 0;
+    @%p bra $done;
+
+    // Thread 0 Kahan-sums the 2*bdx (hi, lo) values in index order.
+    mov.f32 %chi, 0.0;
+    mov.f32 %clo, 0.0;
+    mov.u32 %off, 0;
+$bsum:
+    setp.ge.u32 %p, %off, %bdx;
+    @%p bra $write;
+    mul.wide.u32 %a64, %off, 8;
+    add.u64 %saddr, %sbase, %a64;
+    ld.shared.f32 %tmp, [%saddr];
+    sub.f32 %y, %tmp, %clo;
+    add.f32 %sum, %chi, %y;
+    sub.f32 %clo, %sum, %chi;
+    sub.f32 %clo, %clo, %y;
+    mov.f32 %chi, %sum;
+    ld.shared.f32 %tmp, [%saddr+4];
+    sub.f32 %y, %tmp, %clo;
+    add.f32 %sum, %chi, %y;
+    sub.f32 %clo, %sum, %chi;
+    sub.f32 %clo, %clo, %y;
+    mov.f32 %chi, %sum;
+    add.u32 %off, %off, 1;
+    bra $bsum;
+
+$write:
+    mul.wide.u32 %a64, %blk, 8;
+    add.u64 %addr, %scrptr, %a64;
+    st.global.f32 [%addr], %chi;
+    st.global.f32 [%addr+4], %clo;
+$done:
     ret;
 }
 
-// --- collapse: keep branch `outcome`, renormalise by inv_norm ------
+// prob_finalize: deterministic Kahan sum of block (hi, lo) partials
+.visible .entry prob_finalize(
+    .param .u64 scratch,
+    .param .u32 nblocks,
+    .param .u64 out
+)
+{
+    .reg .u64 %scrptr, %outptr, %addr, %a64, %saddr, %sbase;
+    .reg .u32 %nblk, %tidr, %bdx, %chunk, %start, %end, %off;
+    .reg .f32 %chi, %clo, %tmp, %y, %sum;
+    .reg .pred %p;
+
+    ld.param.u64 %scrptr, [scratch];
+    ld.param.u32 %nblk, [nblocks];
+    ld.param.u64 %outptr, [out];
+
+    mov.u32 %tidr, %tid.x;
+    mov.u32 %bdx, %ntid.x;
+
+    mov.u32 %chunk, %nblk;
+    add.u32 %chunk, %chunk, 255;
+    shr.u32 %chunk, %chunk, 8;
+
+    mul.lo.u32 %start, %tidr, %chunk;
+    mov.u32 %end, %start;
+    add.u32 %end, %end, %chunk;
+    setp.ge.u32 %p, %end, %nblk;
+    @%p mov.u32 %end, %nblk;
+
+    mov.f32 %chi, 0.0;
+    mov.f32 %clo, 0.0;
+    mov.u32 %off, %start;
+$loop:
+    setp.ge.u32 %p, %off, %end;
+    @%p bra $reduce;
+    mul.wide.u32 %a64, %off, 8;
+    add.u64 %addr, %scrptr, %a64;
+    ld.global.f32 %tmp, [%addr];
+    sub.f32 %y, %tmp, %clo;
+    add.f32 %sum, %chi, %y;
+    sub.f32 %clo, %sum, %chi;
+    sub.f32 %clo, %clo, %y;
+    mov.f32 %chi, %sum;
+    ld.global.f32 %tmp, [%addr+4];
+    sub.f32 %y, %tmp, %clo;
+    add.f32 %sum, %chi, %y;
+    sub.f32 %clo, %sum, %chi;
+    sub.f32 %clo, %clo, %y;
+    mov.f32 %chi, %sum;
+    add.u32 %off, %off, 1;
+    bra $loop;
+
+$reduce:
+    mov.u64 %sbase, sdata_prob;
+    mul.wide.u32 %a64, %tidr, 8;
+    add.u64 %saddr, %sbase, %a64;
+    st.shared.f32 [%saddr], %chi;
+    st.shared.f32 [%saddr+4], %clo;
+    bar.sync 0;
+    setp.ne.u32 %p, %tidr, 0;
+    @%p bra $done;
+    mov.f32 %chi, 0.0;
+    mov.f32 %clo, 0.0;
+    mov.u32 %off, 0;
+$bsum:
+    setp.ge.u32 %p, %off, %bdx;
+    @%p bra $write;
+    mul.wide.u32 %a64, %off, 8;
+    add.u64 %saddr, %sbase, %a64;
+    ld.shared.f32 %tmp, [%saddr];
+    sub.f32 %y, %tmp, %clo;
+    add.f32 %sum, %chi, %y;
+    sub.f32 %clo, %sum, %chi;
+    sub.f32 %clo, %clo, %y;
+    mov.f32 %chi, %sum;
+    ld.shared.f32 %tmp, [%saddr+4];
+    sub.f32 %y, %tmp, %clo;
+    add.f32 %sum, %chi, %y;
+    sub.f32 %clo, %sum, %chi;
+    sub.f32 %clo, %clo, %y;
+    mov.f32 %chi, %sum;
+    add.u32 %off, %off, 1;
+    bra $bsum;
+
+$write:
+    add.f32 %tmp, %chi, %clo;
+    st.global.f32 [%outptr], %tmp;
+$done:
+    ret;
+}
+
+// collapse: keep branch `outcome`, renormalise by inv_norm
 .visible .entry collapse(
     .param .u64 s,
     .param .u32 N,
@@ -474,6 +624,2618 @@ $zero:
 $next:
     add.u32 %gtid, %gtid, %total;
     bra $loop;
+$done:
+    ret;
+}
+
+
+
+// v0.2 single-qubit rotation / phase kernels
+// Angles are precomputed on the host (deterministic sin_cos) and passed
+// as f32 params, so the GPU never needs its own trig.
+
+.visible .entry apply_rz(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 q,
+    .param .f32 cs,
+    .param .f32 sn
+)
+{    .reg .u64 %addr_i, %addr_j, %a64;
+    .reg .u32 %gtid, %total, %one, %off, %i, %j;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .u64 %ptr;    .reg .u32 %n;    .reg .u32 %q;    .reg .f32 %cs;    .reg .f32 %sn;    .reg .f32 %re_i, %im_i, %re_j, %im_j, %nr, %ni, %t;
+    .reg .pred %p;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %q, [q];
+    ld.param.f32 %cs, [cs];
+    ld.param.f32 %sn, [sn];
+
+    mov.u32 %one, 1;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+    shl.b32 %off, %one, %q;
+    and.b32 %off, %gtid, %off;
+    setp.eq.u32 %p, %off, 0;
+    @!%p bra $next;
+    mov.u32 %i, %gtid;
+    shl.b32 %off, %one, %q;
+    or.b32 %j, %i, %off;
+
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    mul.wide.u32 %a64, %j, 8;
+    add.u64 %addr_j, %ptr, %a64;
+
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    ld.global.f32 %re_j, [%addr_j];
+    ld.global.f32 %im_j, [%addr_j+4];
+
+    mul.f32 %nr, %re_i, %cs;
+    mul.f32 %t, %im_i, %sn;
+    add.f32 %nr, %nr, %t;
+    mul.f32 %ni, %im_i, %cs;
+    mul.f32 %t, %re_i, %sn;
+    sub.f32 %ni, %ni, %t;
+    st.global.f32 [%addr_i], %nr;
+    st.global.f32 [%addr_i+4], %ni;
+
+    mul.f32 %nr, %re_j, %cs;
+    mul.f32 %t, %im_j, %sn;
+    sub.f32 %nr, %nr, %t;
+    mul.f32 %ni, %im_j, %cs;
+    mul.f32 %t, %re_j, %sn;
+    add.f32 %ni, %ni, %t;
+    st.global.f32 [%addr_j], %nr;
+    st.global.f32 [%addr_j+4], %ni;
+    bra $next;
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+
+.visible .entry apply_rx(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 q,
+    .param .f32 cs,
+    .param .f32 sn
+)
+{    .reg .u64 %addr_i, %addr_j, %a64;
+    .reg .u32 %gtid, %total, %one, %off, %i, %j;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .u64 %ptr;    .reg .u32 %n;    .reg .u32 %q;    .reg .f32 %cs;    .reg .f32 %sn;    .reg .f32 %re_i, %im_i, %re_j, %im_j, %nr, %ni, %t;
+    .reg .pred %p;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %q, [q];
+    ld.param.f32 %cs, [cs];
+    ld.param.f32 %sn, [sn];
+
+    mov.u32 %one, 1;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+    shl.b32 %off, %one, %q;
+    and.b32 %off, %gtid, %off;
+    setp.eq.u32 %p, %off, 0;
+    @!%p bra $next;
+    mov.u32 %i, %gtid;
+    shl.b32 %off, %one, %q;
+    or.b32 %j, %i, %off;
+
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    mul.wide.u32 %a64, %j, 8;
+    add.u64 %addr_j, %ptr, %a64;
+
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    ld.global.f32 %re_j, [%addr_j];
+    ld.global.f32 %im_j, [%addr_j+4];
+
+    mul.f32 %nr, %re_i, %cs;
+    mul.f32 %t, %im_j, %sn;
+    add.f32 %nr, %nr, %t;
+    mul.f32 %ni, %im_i, %cs;
+    mul.f32 %t, %re_j, %sn;
+    sub.f32 %ni, %ni, %t;
+    st.global.f32 [%addr_i], %nr;
+    st.global.f32 [%addr_i+4], %ni;
+
+    mul.f32 %nr, %re_j, %cs;
+    mul.f32 %t, %im_i, %sn;
+    add.f32 %nr, %nr, %t;
+    mul.f32 %ni, %im_j, %cs;
+    mul.f32 %t, %re_i, %sn;
+    sub.f32 %ni, %ni, %t;
+    st.global.f32 [%addr_j], %nr;
+    st.global.f32 [%addr_j+4], %ni;
+    bra $next;
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+
+.visible .entry apply_ry(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 q,
+    .param .f32 cs,
+    .param .f32 sn
+)
+{    .reg .u64 %addr_i, %addr_j, %a64;
+    .reg .u32 %gtid, %total, %one, %off, %i, %j;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .u64 %ptr;    .reg .u32 %n;    .reg .u32 %q;    .reg .f32 %cs;    .reg .f32 %sn;    .reg .f32 %re_i, %im_i, %re_j, %im_j, %nr, %ni, %t;
+    .reg .pred %p;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %q, [q];
+    ld.param.f32 %cs, [cs];
+    ld.param.f32 %sn, [sn];
+
+    mov.u32 %one, 1;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+    shl.b32 %off, %one, %q;
+    and.b32 %off, %gtid, %off;
+    setp.eq.u32 %p, %off, 0;
+    @!%p bra $next;
+    mov.u32 %i, %gtid;
+    shl.b32 %off, %one, %q;
+    or.b32 %j, %i, %off;
+
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    mul.wide.u32 %a64, %j, 8;
+    add.u64 %addr_j, %ptr, %a64;
+
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    ld.global.f32 %re_j, [%addr_j];
+    ld.global.f32 %im_j, [%addr_j+4];
+
+    mul.f32 %nr, %re_i, %cs;
+    mul.f32 %t, %re_j, %sn;
+    sub.f32 %nr, %nr, %t;
+    mul.f32 %ni, %im_i, %cs;
+    mul.f32 %t, %im_j, %sn;
+    sub.f32 %ni, %ni, %t;
+    st.global.f32 [%addr_i], %nr;
+    st.global.f32 [%addr_i+4], %ni;
+
+    mul.f32 %nr, %re_i, %sn;
+    mul.f32 %t, %re_j, %cs;
+    add.f32 %nr, %nr, %t;
+    mul.f32 %ni, %im_i, %sn;
+    mul.f32 %t, %im_j, %cs;
+    add.f32 %ni, %ni, %t;
+    st.global.f32 [%addr_j], %nr;
+    st.global.f32 [%addr_j+4], %ni;
+    bra $next;
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+
+.visible .entry apply_phase(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 q,
+    .param .f32 c,
+    .param .f32 sn
+)
+{    .reg .u64 %addr_i, %addr_j, %a64;
+    .reg .u32 %gtid, %total, %one, %off, %i, %j;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .u64 %ptr;    .reg .u32 %n;    .reg .u32 %q;    .reg .f32 %c;    .reg .f32 %sn;    .reg .f32 %re_i, %im_i, %re_j, %im_j, %nr, %ni, %t;
+    .reg .pred %p;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %q, [q];
+    ld.param.f32 %c, [c];
+    ld.param.f32 %sn, [sn];
+
+    mov.u32 %one, 1;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+    shl.b32 %off, %one, %q;
+    and.b32 %off, %gtid, %off;
+    setp.eq.u32 %p, %off, 0;
+    @!%p bra $next;
+    mov.u32 %i, %gtid;
+    shl.b32 %off, %one, %q;
+    or.b32 %j, %i, %off;
+
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    mul.wide.u32 %a64, %j, 8;
+    add.u64 %addr_j, %ptr, %a64;
+
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    ld.global.f32 %re_j, [%addr_j];
+    ld.global.f32 %im_j, [%addr_j+4];
+
+    mul.f32 %nr, %re_j, %c;
+    mul.f32 %t, %im_j, %sn;
+    sub.f32 %nr, %nr, %t;
+    mul.f32 %ni, %re_j, %sn;
+    mul.f32 %t, %im_j, %c;
+    add.f32 %ni, %ni, %t;
+    st.global.f32 [%addr_j], %nr;
+    st.global.f32 [%addr_j+4], %ni;
+    bra $next;
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+
+.visible .entry apply_s(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 q
+)
+{    .reg .u64 %addr_i, %addr_j, %a64;
+    .reg .u32 %gtid, %total, %one, %off, %i, %j;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .u64 %ptr;    .reg .u32 %n;    .reg .u32 %q;    .reg .f32 %re_i, %im_i, %re_j, %im_j, %nr, %ni, %t;
+    .reg .pred %p;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %q, [q];
+
+    mov.u32 %one, 1;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+    shl.b32 %off, %one, %q;
+    and.b32 %off, %gtid, %off;
+    setp.eq.u32 %p, %off, 0;
+    @!%p bra $next;
+    mov.u32 %i, %gtid;
+    shl.b32 %off, %one, %q;
+    or.b32 %j, %i, %off;
+
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    mul.wide.u32 %a64, %j, 8;
+    add.u64 %addr_j, %ptr, %a64;
+
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    ld.global.f32 %re_j, [%addr_j];
+    ld.global.f32 %im_j, [%addr_j+4];
+
+    neg.f32 %nr, %im_j;
+    mov.f32 %ni, %re_j;
+    st.global.f32 [%addr_j], %nr;
+    st.global.f32 [%addr_j+4], %ni;
+    bra $next;
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+
+.visible .entry apply_sdg(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 q
+)
+{    .reg .u64 %addr_i, %addr_j, %a64;
+    .reg .u32 %gtid, %total, %one, %off, %i, %j;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .u64 %ptr;    .reg .u32 %n;    .reg .u32 %q;    .reg .f32 %re_i, %im_i, %re_j, %im_j, %nr, %ni, %t;
+    .reg .pred %p;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %q, [q];
+
+    mov.u32 %one, 1;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+    shl.b32 %off, %one, %q;
+    and.b32 %off, %gtid, %off;
+    setp.eq.u32 %p, %off, 0;
+    @!%p bra $next;
+    mov.u32 %i, %gtid;
+    shl.b32 %off, %one, %q;
+    or.b32 %j, %i, %off;
+
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    mul.wide.u32 %a64, %j, 8;
+    add.u64 %addr_j, %ptr, %a64;
+
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    ld.global.f32 %re_j, [%addr_j];
+    ld.global.f32 %im_j, [%addr_j+4];
+
+    mov.f32 %nr, %im_j;
+    neg.f32 %ni, %re_j;
+    st.global.f32 [%addr_j], %nr;
+    st.global.f32 [%addr_j+4], %ni;
+    bra $next;
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+
+.visible .entry apply_t(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 q
+)
+{    .reg .u64 %addr_i, %addr_j, %a64;
+    .reg .u32 %gtid, %total, %one, %off, %i, %j;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .u64 %ptr;    .reg .u32 %n;    .reg .u32 %q;    .reg .f32 %re_i, %im_i, %re_j, %im_j, %nr, %ni, %t;
+    .reg .pred %p;
+    .reg .f32 %x, %y;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %q, [q];
+
+    mov.u32 %one, 1;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+    shl.b32 %off, %one, %q;
+    and.b32 %off, %gtid, %off;
+    setp.eq.u32 %p, %off, 0;
+    @!%p bra $next;
+    mov.u32 %i, %gtid;
+    shl.b32 %off, %one, %q;
+    or.b32 %j, %i, %off;
+
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    mul.wide.u32 %a64, %j, 8;
+    add.u64 %addr_j, %ptr, %a64;
+
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    ld.global.f32 %re_j, [%addr_j];
+    ld.global.f32 %im_j, [%addr_j+4];
+
+    mov.f32 %t, 0.70710678;
+    mul.f32 %x, %re_j, %t;
+    mul.f32 %y, %im_j, %t;
+    sub.f32 %nr, %x, %y;
+    add.f32 %ni, %x, %y;
+    st.global.f32 [%addr_j], %nr;
+    st.global.f32 [%addr_j+4], %ni;
+    bra $next;
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+
+.visible .entry apply_sx(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 q
+)
+{    .reg .u64 %addr_i, %addr_j, %a64;
+    .reg .u32 %gtid, %total, %one, %off, %i, %j;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .u64 %ptr;    .reg .u32 %n;    .reg .u32 %q;    .reg .f32 %re_i, %im_i, %re_j, %im_j, %nr, %ni, %t;
+    .reg .pred %p;
+    .reg .f32 %x, %y;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %q, [q];
+
+    mov.u32 %one, 1;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+    shl.b32 %off, %one, %q;
+    and.b32 %off, %gtid, %off;
+    setp.eq.u32 %p, %off, 0;
+    @!%p bra $next;
+    mov.u32 %i, %gtid;
+    shl.b32 %off, %one, %q;
+    or.b32 %j, %i, %off;
+
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    mul.wide.u32 %a64, %j, 8;
+    add.u64 %addr_j, %ptr, %a64;
+
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    ld.global.f32 %re_j, [%addr_j];
+    ld.global.f32 %im_j, [%addr_j+4];
+
+    mov.f32 %t, 0.5;
+    sub.f32 %x, %re_i, %im_i;
+    add.f32 %y, %re_j, %im_j;
+    add.f32 %x, %x, %y;
+    mul.f32 %nr, %x, %t;
+    add.f32 %x, %re_i, %im_i;
+    sub.f32 %y, %im_j, %re_j;
+    add.f32 %x, %x, %y;
+    mul.f32 %ni, %x, %t;
+    st.global.f32 [%addr_i], %nr;
+    st.global.f32 [%addr_i+4], %ni;
+
+    add.f32 %x, %re_i, %im_i;
+    sub.f32 %y, %re_j, %im_j;
+    add.f32 %x, %x, %y;
+    mul.f32 %nr, %x, %t;
+    sub.f32 %x, %im_i, %re_i;
+    add.f32 %y, %re_j, %im_j;
+    add.f32 %x, %x, %y;
+    mul.f32 %ni, %x, %t;
+    st.global.f32 [%addr_j], %nr;
+    st.global.f32 [%addr_j+4], %ni;
+    bra $next;
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+
+// v0.2 multi-qubit gates
+
+.visible .entry apply_swap(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 a,
+    .param .u32 b
+)
+{    .reg .u64 %addr_i, %addr_j, %a64;
+    .reg .u32 %gtid, %total, %one, %off, %i, %j;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .u64 %ptr;    .reg .u32 %n;    .reg .u32 %a;    .reg .u32 %b;    .reg .f32 %re_i, %im_i, %re_j, %im_j;
+    .reg .pred %p;
+    .reg .u32 %abit, %bbit;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %a, [a];
+    ld.param.u32 %b, [b];
+    mov.u32 %one, 1;
+    shl.b32 %abit, %one, %a;
+    shl.b32 %bbit, %one, %b;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+    and.b32 %off, %gtid, %abit;
+    setp.eq.u32 %p, %off, %abit;
+    @!%p bra $next;
+    and.b32 %off, %gtid, %bbit;
+    setp.eq.u32 %p, %off, 0;
+    @!%p bra $next;
+    mov.u32 %i, %gtid;
+    mov.u32 %j, %i;
+    xor.b32 %j, %j, %abit;
+    xor.b32 %j, %j, %bbit;
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    mul.wide.u32 %a64, %j, 8;
+    add.u64 %addr_j, %ptr, %a64;
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    ld.global.f32 %re_j, [%addr_j];
+    ld.global.f32 %im_j, [%addr_j+4];
+    st.global.f32 [%addr_i], %re_j;
+    st.global.f32 [%addr_i+4], %im_j;
+    st.global.f32 [%addr_j], %re_i;
+    st.global.f32 [%addr_j+4], %im_i;
+    bra $next;
+
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+
+.visible .entry apply_iswap(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 a,
+    .param .u32 b
+)
+{    .reg .u64 %addr_i, %addr_j, %a64;
+    .reg .u32 %gtid, %total, %one, %off, %i, %j;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .u64 %ptr;    .reg .u32 %n;    .reg .u32 %a;    .reg .u32 %b;    .reg .f32 %re_i, %im_i, %re_j, %im_j, %nr, %ni;
+    .reg .pred %p;
+    .reg .u32 %abit, %bbit;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %a, [a];
+    ld.param.u32 %b, [b];
+    mov.u32 %one, 1;
+    shl.b32 %abit, %one, %a;
+    shl.b32 %bbit, %one, %b;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+    and.b32 %off, %gtid, %abit;
+    setp.eq.u32 %p, %off, %abit;
+    @!%p bra $next;
+    and.b32 %off, %gtid, %bbit;
+    setp.eq.u32 %p, %off, 0;
+    @!%p bra $next;
+    mov.u32 %i, %gtid;
+    mov.u32 %j, %i;
+    xor.b32 %j, %j, %abit;
+    xor.b32 %j, %j, %bbit;
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    mul.wide.u32 %a64, %j, 8;
+    add.u64 %addr_j, %ptr, %a64;
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    ld.global.f32 %re_j, [%addr_j];
+    ld.global.f32 %im_j, [%addr_j+4];
+    neg.f32 %nr, %im_j;
+    mov.f32 %ni, %re_j;
+    st.global.f32 [%addr_i], %nr;
+    st.global.f32 [%addr_i+4], %ni;
+    neg.f32 %nr, %im_i;
+    mov.f32 %ni, %re_i;
+    st.global.f32 [%addr_j], %nr;
+    st.global.f32 [%addr_j+4], %ni;
+    bra $next;
+
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+
+.visible .entry apply_cz(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 a,
+    .param .u32 b
+)
+{    .reg .u64 %addr_i, %addr_j, %a64;
+    .reg .u32 %gtid, %total, %one, %off, %i, %j;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .u64 %ptr;    .reg .u32 %n;    .reg .u32 %a;    .reg .u32 %b;    .reg .f32 %re_i, %im_i;
+    .reg .pred %p;
+    .reg .u32 %amask;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %a, [a];
+    ld.param.u32 %b, [b];
+    mov.u32 %one, 1;
+    shl.b32 %amask, %one, %a;
+    shl.b32 %off, %one, %b;
+    or.b32 %amask, %amask, %off;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+    and.b32 %off, %gtid, %amask;
+    setp.eq.u32 %p, %off, %amask;
+    @!%p bra $next;
+    mul.wide.u32 %a64, %gtid, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    neg.f32 %re_i, %re_i;
+    neg.f32 %im_i, %im_i;
+    st.global.f32 [%addr_i], %re_i;
+    st.global.f32 [%addr_i+4], %im_i;
+    bra $next;
+
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+
+.visible .entry apply_cphase(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 a,
+    .param .u32 b,
+    .param .f32 c,
+    .param .f32 sn
+)
+{    .reg .u64 %addr_i, %addr_j, %a64;
+    .reg .u32 %gtid, %total, %one, %off, %i, %j;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .u64 %ptr;    .reg .u32 %n;    .reg .u32 %a;    .reg .u32 %b;    .reg .f32 %c;    .reg .f32 %sn;    .reg .f32 %re_i, %im_i, %nr, %ni, %t;
+    .reg .pred %p;
+    .reg .u32 %amask;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %a, [a];
+    ld.param.u32 %b, [b];
+    ld.param.f32 %c, [c];
+    ld.param.f32 %sn, [sn];
+    mov.u32 %one, 1;
+    shl.b32 %amask, %one, %a;
+    shl.b32 %off, %one, %b;
+    or.b32 %amask, %amask, %off;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+    and.b32 %off, %gtid, %amask;
+    setp.eq.u32 %p, %off, %amask;
+    @!%p bra $next;
+    mul.wide.u32 %a64, %gtid, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    mul.f32 %nr, %re_i, %c;
+    mul.f32 %t, %im_i, %sn;
+    sub.f32 %nr, %nr, %t;
+    mul.f32 %ni, %re_i, %sn;
+    mul.f32 %t, %im_i, %c;
+    add.f32 %ni, %ni, %t;
+    st.global.f32 [%addr_i], %nr;
+    st.global.f32 [%addr_i+4], %ni;
+    bra $next;
+
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+
+.visible .entry apply_cswap(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 ctl,
+    .param .u32 b,
+    .param .u32 c
+)
+{    .reg .u64 %addr_i, %addr_j, %a64;
+    .reg .u32 %gtid, %total, %one, %off, %i, %j;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .u64 %ptr;    .reg .u32 %n;    .reg .u32 %ctl;    .reg .u32 %b;    .reg .u32 %c;    .reg .f32 %re_i, %im_i, %re_j, %im_j;
+    .reg .pred %p;
+    .reg .u32 %cbit, %bbit, %cbit2;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %ctl, [ctl];
+    ld.param.u32 %b, [b];
+    ld.param.u32 %c, [c];
+    mov.u32 %one, 1;
+    shl.b32 %cbit, %one, %ctl;
+    shl.b32 %bbit, %one, %b;
+    shl.b32 %cbit2, %one, %c;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+    and.b32 %off, %gtid, %cbit;
+    setp.eq.u32 %p, %off, %cbit;
+    @!%p bra $next;
+    and.b32 %off, %gtid, %bbit;
+    setp.eq.u32 %p, %off, %bbit;
+    @!%p bra $next;
+    and.b32 %off, %gtid, %cbit2;
+    setp.eq.u32 %p, %off, 0;
+    @!%p bra $next;
+    mov.u32 %i, %gtid;
+    mov.u32 %j, %i;
+    xor.b32 %j, %j, %bbit;
+    xor.b32 %j, %j, %cbit2;
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    mul.wide.u32 %a64, %j, 8;
+    add.u64 %addr_j, %ptr, %a64;
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    ld.global.f32 %re_j, [%addr_j];
+    ld.global.f32 %im_j, [%addr_j+4];
+    st.global.f32 [%addr_i], %re_j;
+    st.global.f32 [%addr_i+4], %im_j;
+    st.global.f32 [%addr_j], %re_i;
+    st.global.f32 [%addr_j+4], %im_i;
+    bra $next;
+
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+
+.visible .entry apply_mcx(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 mask,
+    .param .u32 t
+)
+{    .reg .u64 %addr_i, %addr_j, %a64;
+    .reg .u32 %gtid, %total, %one, %off, %i, %j;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+    .reg .u64 %ptr;    .reg .u32 %n;    .reg .u32 %mask;    .reg .u32 %t;    .reg .f32 %re_i, %im_i, %re_j, %im_j;
+    .reg .pred %p;
+    .reg .u32 %tbit;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %mask, [mask];
+    ld.param.u32 %t, [t];
+    mov.u32 %one, 1;
+    shl.b32 %tbit, %one, %t;
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $done;
+    and.b32 %off, %gtid, %mask;
+    setp.eq.u32 %p, %off, %mask;
+    @!%p bra $next;
+    and.b32 %off, %gtid, %tbit;
+    setp.eq.u32 %p, %off, 0;
+    @!%p bra $next;
+    mov.u32 %i, %gtid;
+    mov.u32 %j, %i;
+    xor.b32 %j, %j, %tbit;
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    mul.wide.u32 %a64, %j, 8;
+    add.u64 %addr_j, %ptr, %a64;
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    ld.global.f32 %re_j, [%addr_j];
+    ld.global.f32 %im_j, [%addr_j+4];
+    st.global.f32 [%addr_i], %re_j;
+    st.global.f32 [%addr_i+4], %im_j;
+    st.global.f32 [%addr_j], %re_i;
+    st.global.f32 [%addr_j+4], %im_i;
+    bra $next;
+
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+$done:
+    ret;
+}
+
+
+
+// cooperative grid barrier (M4-P2 persistent kernel)
+// Requires a cooperative launch (all blocks resident). Monotonic phase
+// counter: barrier k expects phase == k after all blocks have arrived.
+.global .align 4 .b32 g_bar_arrived;
+.global .align 4 .b32 g_bar_phase;
+
+// Grid-wide barrier. Every thread in every block must reach it exactly the
+// same number of times, or the kernel deadlocks. Expected phase = the count
+// of barriers already completed (1 for the first barrier).
+.func grid_sync(.param .u32 phase)
+{
+    .reg .pred %p;
+    .reg .u32 %tidr, %val, %nblk;
+    .reg .u64 %addr;
+    .reg .u32 %phase;
+
+    ld.param.u32 %phase, [phase];
+    mov.u32 %tidr, %tid.x;
+    bar.sync 0;
+
+    setp.ne.u32 %p, %tidr, 0;
+    @%p bra $wait;
+
+    // Block leader: arrive.
+    mov.u64 %addr, g_bar_arrived;
+    atom.add.u32 %val, [%addr], 1;
+    mov.u32 %nblk, %nctaid.x;
+    add.u32 %nblk, %nblk, -1;
+    setp.eq.u32 %p, %val, %nblk;
+    @!%p bra $wait;
+
+    // Last block: reset the counter and release the phase.
+    st.global.u32 [%addr], 0;
+    membar.gl;
+    mov.u64 %addr, g_bar_phase;
+    st.global.u32 [%addr], %phase;
+    membar.gl;
+    bra $done;
+
+$wait:
+    // Spin (volatile so the store is always observed) until the phase.
+    mov.u64 %addr, g_bar_phase;
+$spin:
+    ld.volatile.global.u32 %val, [%addr];
+    setp.eq.u32 %p, %val, %phase;
+    @!%p bra $spin;
+    membar.gl;
+$done:
+    bar.sync 0;
+    ret;
+}
+
+// barrier_bench: time N grid barriers over a real buffer.
+// Not loaded by the Rust backend; kept for grid-barrier measurement only.
+.visible .entry barrier_bench(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 iters
+)
+{
+    .reg .pred %p;
+    .reg .u32 %k, %iters, %phase, %n;
+    .reg .u64 %ptr, %a64;
+    .reg .f32 %one;
+    .reg .u32 %gtid, %total, %oneu, %off;
+    .reg .u32 %blk, %bdx, %tix, %gdx;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %iters, [iters];
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+    mov.f32 %one, 1.0;
+    mov.u32 %oneu, 1;
+    mov.u32 %k, 0;
+
+$loop:
+    setp.ge.u32 %p, %k, %iters;
+    @%p bra $done;
+
+    // touch one element per thread to give the barrier real work
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $sync;
+    mul.wide.u32 %a64, %gtid, 8;
+    add.u64 %a64, %ptr, %a64;
+    st.global.f32 [%a64], %one;
+$sync:
+    add.u32 %phase, %k, 1;
+    call grid_sync, (%phase);
+    add.u32 %k, %k, 1;
+    bra $loop;
+$done:
+    ret;
+}
+
+
+
+// shared-memory mega-kernel gate funcs
+.func g_h(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.u64 %p, [p];
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    and.b32 %bit, %i, %bit;
+    setp.ne.u32 %pp, %bit, 0;
+    @%pp ret;
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    or.b32 %j, %i, %bit;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    mul.wide.u32 %aj, %j, 8;
+    add.u64 %aj, %p, %aj;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    ld.shared.f32 %rj, [%aj];
+    ld.shared.f32 %ij, [%aj+4];
+
+    mov.f32 %t0, 0.70710678;
+    add.f32 %u0, %ri, %rj; mul.f32 %nri, %u0, %t0;
+    add.f32 %u0, %ii, %ij; mul.f32 %nii, %u0, %t0;
+    sub.f32 %u0, %ri, %rj; mul.f32 %nrj, %u0, %t0;
+    sub.f32 %u0, %ii, %ij; mul.f32 %nij, %u0, %t0;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+    st.shared.f32 [%aj], %nrj;
+    st.shared.f32 [%aj+4], %nij;
+}
+
+
+.func g_x(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.u64 %p, [p];
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    and.b32 %bit, %i, %bit;
+    setp.ne.u32 %pp, %bit, 0;
+    @%pp ret;
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    or.b32 %j, %i, %bit;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    mul.wide.u32 %aj, %j, 8;
+    add.u64 %aj, %p, %aj;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    ld.shared.f32 %rj, [%aj];
+    ld.shared.f32 %ij, [%aj+4];
+    mov.f32 %nri, %rj; mov.f32 %nii, %ij;
+    mov.f32 %nrj, %ri; mov.f32 %nij, %ii;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+    st.shared.f32 [%aj], %nrj;
+    st.shared.f32 [%aj+4], %nij;
+}
+
+
+.func g_cnot(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .u32 q1,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %cbit, %tbit;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .u32 %q1;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.u32 %q1, [q1];
+    ld.param.u64 %p, [p];
+    mov.u32 %tbit, 1; shl.b32 %tbit, %tbit, %q1;
+    and.b32 %tbit, %i, %tbit; setp.ne.u32 %pp, %tbit, 0; @%pp ret;
+    mov.u32 %cbit, 1; shl.b32 %cbit, %cbit, %q0;
+    and.b32 %cbit, %i, %cbit; setp.eq.u32 %pp, %cbit, 0; @%pp ret;
+    mov.u32 %bit, 1; shl.b32 %bit, %bit, %q1;
+    or.b32 %j, %i, %bit;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    mul.wide.u32 %aj, %j, 8;
+    add.u64 %aj, %p, %aj;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    ld.shared.f32 %rj, [%aj];
+    ld.shared.f32 %ij, [%aj+4];
+    mov.f32 %nri, %rj; mov.f32 %nii, %ij;
+    mov.f32 %nrj, %ri; mov.f32 %nij, %ii;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+    st.shared.f32 [%aj], %nrj;
+    st.shared.f32 [%aj+4], %nij;
+}
+
+
+.func g_toff(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .u32 q1,
+    .param .u32 q2,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %cbit, %tbit, %mb;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .u32 %q1;    .reg .u32 %q2;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.u32 %q1, [q1];
+    ld.param.u32 %q2, [q2];
+    ld.param.u64 %p, [p];
+    mov.u32 %mb, 1; shl.b32 %mb, %mb, %q0;
+    mov.u32 %tbit, 1; shl.b32 %tbit, %tbit, %q1;
+    or.b32 %mb, %mb, %tbit;
+    and.b32 %mb, %i, %mb;
+    mov.u32 %tbit, 1; shl.b32 %tbit, %tbit, %q0;
+    mov.u32 %cbit, 1; shl.b32 %cbit, %cbit, %q1;
+    or.b32 %cbit, %cbit, %tbit;
+    setp.ne.u32 %pp, %mb, %cbit; @%pp ret;
+    mov.u32 %tbit, 1; shl.b32 %tbit, %tbit, %q2;
+    and.b32 %tbit, %i, %tbit; setp.ne.u32 %pp, %tbit, 0; @%pp ret;
+    mov.u32 %bit, 1; shl.b32 %bit, %bit, %q2;
+    or.b32 %j, %i, %bit;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    mul.wide.u32 %aj, %j, 8;
+    add.u64 %aj, %p, %aj;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    ld.shared.f32 %rj, [%aj];
+    ld.shared.f32 %ij, [%aj+4];
+    mov.f32 %nri, %rj; mov.f32 %nii, %ij;
+    mov.f32 %nrj, %ri; mov.f32 %nij, %ii;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+    st.shared.f32 [%aj], %nrj;
+    st.shared.f32 [%aj+4], %nij;
+}
+
+
+.func g_rz(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .f32 cs,
+    .param .f32 sn,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .f32 %cs;    .reg .f32 %sn;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.f32 %cs, [cs];
+    ld.param.f32 %sn, [sn];
+    ld.param.u64 %p, [p];
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    and.b32 %bit, %i, %bit;
+    setp.ne.u32 %pp, %bit, 0;
+    @%pp ret;
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    or.b32 %j, %i, %bit;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    mul.wide.u32 %aj, %j, 8;
+    add.u64 %aj, %p, %aj;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    ld.shared.f32 %rj, [%aj];
+    ld.shared.f32 %ij, [%aj+4];
+
+    mul.f32 %t0, %ri, %cs; mul.f32 %u0, %ii, %sn;
+    add.f32 %nri, %t0, %u0;
+    mul.f32 %t0, %ii, %cs; mul.f32 %u0, %ri, %sn;
+    sub.f32 %nii, %t0, %u0;
+    mul.f32 %t0, %rj, %cs; mul.f32 %u0, %ij, %sn;
+    sub.f32 %nrj, %t0, %u0;
+    mul.f32 %t0, %ij, %cs; mul.f32 %u0, %rj, %sn;
+    add.f32 %nij, %t0, %u0;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+    st.shared.f32 [%aj], %nrj;
+    st.shared.f32 [%aj+4], %nij;
+}
+
+
+.func g_rx(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .f32 cs,
+    .param .f32 sn,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .f32 %cs;    .reg .f32 %sn;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.f32 %cs, [cs];
+    ld.param.f32 %sn, [sn];
+    ld.param.u64 %p, [p];
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    and.b32 %bit, %i, %bit;
+    setp.ne.u32 %pp, %bit, 0;
+    @%pp ret;
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    or.b32 %j, %i, %bit;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    mul.wide.u32 %aj, %j, 8;
+    add.u64 %aj, %p, %aj;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    ld.shared.f32 %rj, [%aj];
+    ld.shared.f32 %ij, [%aj+4];
+
+    mul.f32 %t0, %ri, %cs; mul.f32 %u0, %ij, %sn;
+    add.f32 %nri, %t0, %u0;
+    mul.f32 %t0, %ii, %cs; mul.f32 %u0, %rj, %sn;
+    sub.f32 %nii, %t0, %u0;
+    mul.f32 %t0, %rj, %cs; mul.f32 %u0, %ii, %sn;
+    add.f32 %nrj, %t0, %u0;
+    mul.f32 %t0, %ij, %cs; mul.f32 %u0, %ri, %sn;
+    sub.f32 %nij, %t0, %u0;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+    st.shared.f32 [%aj], %nrj;
+    st.shared.f32 [%aj+4], %nij;
+}
+
+
+.func g_ry(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .f32 cs,
+    .param .f32 sn,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .f32 %cs;    .reg .f32 %sn;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.f32 %cs, [cs];
+    ld.param.f32 %sn, [sn];
+    ld.param.u64 %p, [p];
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    and.b32 %bit, %i, %bit;
+    setp.ne.u32 %pp, %bit, 0;
+    @%pp ret;
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    or.b32 %j, %i, %bit;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    mul.wide.u32 %aj, %j, 8;
+    add.u64 %aj, %p, %aj;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    ld.shared.f32 %rj, [%aj];
+    ld.shared.f32 %ij, [%aj+4];
+
+    mul.f32 %t0, %ri, %cs; mul.f32 %u0, %rj, %sn;
+    sub.f32 %nri, %t0, %u0;
+    mul.f32 %t0, %ii, %cs; mul.f32 %u0, %ij, %sn;
+    sub.f32 %nii, %t0, %u0;
+    mul.f32 %t0, %ri, %sn; mul.f32 %u0, %rj, %cs;
+    add.f32 %nrj, %t0, %u0;
+    mul.f32 %t0, %ii, %sn; mul.f32 %u0, %ij, %cs;
+    add.f32 %nij, %t0, %u0;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+    st.shared.f32 [%aj], %nrj;
+    st.shared.f32 [%aj+4], %nij;
+}
+
+
+.func g_phase(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .f32 c,
+    .param .f32 sn,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .f32 %c;    .reg .f32 %sn;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.f32 %c, [c];
+    ld.param.f32 %sn, [sn];
+    ld.param.u64 %p, [p];
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    and.b32 %bit, %i, %bit;
+    setp.ne.u32 %pp, %bit, 0;
+    @%pp ret;
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    or.b32 %j, %i, %bit;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    mul.wide.u32 %aj, %j, 8;
+    add.u64 %aj, %p, %aj;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    ld.shared.f32 %rj, [%aj];
+    ld.shared.f32 %ij, [%aj+4];
+
+    mov.f32 %nri, %ri; mov.f32 %nii, %ii;
+    mul.f32 %t0, %rj, %c; mul.f32 %u0, %ij, %sn;
+    sub.f32 %nrj, %t0, %u0;
+    mul.f32 %t0, %rj, %sn; mul.f32 %u0, %ij, %c;
+    add.f32 %nij, %t0, %u0;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+    st.shared.f32 [%aj], %nrj;
+    st.shared.f32 [%aj+4], %nij;
+}
+
+
+.func g_s(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.u64 %p, [p];
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    and.b32 %bit, %i, %bit;
+    setp.ne.u32 %pp, %bit, 0;
+    @%pp ret;
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    or.b32 %j, %i, %bit;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    mul.wide.u32 %aj, %j, 8;
+    add.u64 %aj, %p, %aj;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    ld.shared.f32 %rj, [%aj];
+    ld.shared.f32 %ij, [%aj+4];
+
+    mov.f32 %nri, %ri; mov.f32 %nii, %ii;
+    neg.f32 %nrj, %ij;
+    mov.f32 %nij, %rj;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+    st.shared.f32 [%aj], %nrj;
+    st.shared.f32 [%aj+4], %nij;
+}
+
+
+.func g_sdg(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.u64 %p, [p];
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    and.b32 %bit, %i, %bit;
+    setp.ne.u32 %pp, %bit, 0;
+    @%pp ret;
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    or.b32 %j, %i, %bit;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    mul.wide.u32 %aj, %j, 8;
+    add.u64 %aj, %p, %aj;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    ld.shared.f32 %rj, [%aj];
+    ld.shared.f32 %ij, [%aj+4];
+
+    mov.f32 %nri, %ri; mov.f32 %nii, %ii;
+    mov.f32 %nrj, %ij;
+    neg.f32 %nij, %rj;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+    st.shared.f32 [%aj], %nrj;
+    st.shared.f32 [%aj+4], %nij;
+}
+
+
+.func g_t(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.u64 %p, [p];
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    and.b32 %bit, %i, %bit;
+    setp.ne.u32 %pp, %bit, 0;
+    @%pp ret;
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    or.b32 %j, %i, %bit;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    mul.wide.u32 %aj, %j, 8;
+    add.u64 %aj, %p, %aj;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    ld.shared.f32 %rj, [%aj];
+    ld.shared.f32 %ij, [%aj+4];
+
+    mov.f32 %nri, %ri; mov.f32 %nii, %ii;
+    mov.f32 %t0, 0.70710678;
+    mul.f32 %u0, %rj, %t0; mul.f32 %v0, %ij, %t0;
+    sub.f32 %nrj, %u0, %v0;
+    add.f32 %nij, %u0, %v0;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+    st.shared.f32 [%aj], %nrj;
+    st.shared.f32 [%aj+4], %nij;
+}
+
+
+.func g_sx(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.u64 %p, [p];
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    and.b32 %bit, %i, %bit;
+    setp.ne.u32 %pp, %bit, 0;
+    @%pp ret;
+    mov.u32 %bit, 1;
+    shl.b32 %bit, %bit, %q0;
+    or.b32 %j, %i, %bit;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    mul.wide.u32 %aj, %j, 8;
+    add.u64 %aj, %p, %aj;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    ld.shared.f32 %rj, [%aj];
+    ld.shared.f32 %ij, [%aj+4];
+
+    mov.f32 %t0, 0.5;
+    sub.f32 %u0, %ri, %ii; add.f32 %v0, %rj, %ij;
+    add.f32 %u0, %u0, %v0; mul.f32 %nri, %u0, %t0;
+    add.f32 %u0, %ri, %ii; sub.f32 %v0, %ij, %rj;
+    add.f32 %u0, %u0, %v0; mul.f32 %nii, %u0, %t0;
+    add.f32 %u0, %ri, %ii; sub.f32 %v0, %rj, %ij;
+    add.f32 %u0, %u0, %v0; mul.f32 %nrj, %u0, %t0;
+    sub.f32 %u0, %ii, %ri; add.f32 %v0, %rj, %ij;
+    add.f32 %u0, %u0, %v0; mul.f32 %nij, %u0, %t0;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+    st.shared.f32 [%aj], %nrj;
+    st.shared.f32 [%aj+4], %nij;
+}
+
+
+.func g_swap(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .u32 q1,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %abit, %bbit, %tbit;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .u32 %q1;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.u32 %q1, [q1];
+    ld.param.u64 %p, [p];
+    mov.u32 %abit, 1; shl.b32 %abit, %abit, %q0;
+    and.b32 %abit, %i, %abit; setp.eq.u32 %pp, %abit, 0; @%pp ret;
+    mov.u32 %bbit, 1; shl.b32 %bbit, %bbit, %q1;
+    and.b32 %bbit, %i, %bbit; setp.ne.u32 %pp, %bbit, 0; @%pp ret;
+    mov.u32 %bit, 1; shl.b32 %bit, %bit, %q0;
+    mov.u32 %tbit, 1; shl.b32 %tbit, %tbit, %q1;
+    or.b32 %bit, %bit, %tbit;
+    xor.b32 %j, %i, %bit;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    mul.wide.u32 %aj, %j, 8;
+    add.u64 %aj, %p, %aj;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    ld.shared.f32 %rj, [%aj];
+    ld.shared.f32 %ij, [%aj+4];
+    mov.f32 %nri, %rj; mov.f32 %nii, %ij;
+    mov.f32 %nrj, %ri; mov.f32 %nij, %ii;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+    st.shared.f32 [%aj], %nrj;
+    st.shared.f32 [%aj+4], %nij;
+}
+
+
+.func g_iswap(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .u32 q1,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %abit, %bbit, %tbit;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .u32 %q1;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.u32 %q1, [q1];
+    ld.param.u64 %p, [p];
+    mov.u32 %abit, 1; shl.b32 %abit, %abit, %q0;
+    and.b32 %abit, %i, %abit; setp.eq.u32 %pp, %abit, 0; @%pp ret;
+    mov.u32 %bbit, 1; shl.b32 %bbit, %bbit, %q1;
+    and.b32 %bbit, %i, %bbit; setp.ne.u32 %pp, %bbit, 0; @%pp ret;
+    mov.u32 %bit, 1; shl.b32 %bit, %bit, %q0;
+    mov.u32 %tbit, 1; shl.b32 %tbit, %tbit, %q1;
+    or.b32 %bit, %bit, %tbit;
+    xor.b32 %j, %i, %bit;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    mul.wide.u32 %aj, %j, 8;
+    add.u64 %aj, %p, %aj;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    ld.shared.f32 %rj, [%aj];
+    ld.shared.f32 %ij, [%aj+4];
+
+    neg.f32 %nri, %ij;
+    mov.f32 %nii, %rj;
+    neg.f32 %nrj, %ii;
+    mov.f32 %nij, %ri;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+    st.shared.f32 [%aj], %nrj;
+    st.shared.f32 [%aj+4], %nij;
+}
+
+
+.func g_cz(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .u32 q1,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %abit, %bbit, %tbit;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .u32 %q1;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.u32 %q1, [q1];
+    ld.param.u64 %p, [p];
+    mov.u32 %abit, 1; shl.b32 %abit, %abit, %q0;
+    and.b32 %abit, %i, %abit; setp.eq.u32 %pp, %abit, 0; @%pp ret;
+    mov.u32 %bbit, 1; shl.b32 %bbit, %bbit, %q1;
+    and.b32 %bbit, %i, %bbit; setp.eq.u32 %pp, %bbit, 0; @%pp ret;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    neg.f32 %nri, %ri;
+    neg.f32 %nii, %ii;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+}
+
+
+.func g_cphase(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .u32 q1,
+    .param .f32 c,
+    .param .f32 sn,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %abit, %bbit;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .u32 %q1;    .reg .f32 %c;    .reg .f32 %sn;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.u32 %q1, [q1];
+    ld.param.f32 %c, [c];
+    ld.param.f32 %sn, [sn];
+    ld.param.u64 %p, [p];
+    mov.u32 %abit, 1; shl.b32 %abit, %abit, %q0;
+    and.b32 %abit, %i, %abit; setp.eq.u32 %pp, %abit, 0; @%pp ret;
+    mov.u32 %bbit, 1; shl.b32 %bbit, %bbit, %q1;
+    and.b32 %bbit, %i, %bbit; setp.eq.u32 %pp, %bbit, 0; @%pp ret;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    mul.f32 %t0, %ri, %c; mul.f32 %u0, %ii, %sn;
+    sub.f32 %nri, %t0, %u0;
+    mul.f32 %t0, %ri, %sn; mul.f32 %u0, %ii, %c;
+    add.f32 %nii, %t0, %u0;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+}
+
+
+.func g_cswap(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .u32 q1,
+    .param .u32 q2,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %cbit, %bbit, %cbit2, %tbit;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .u32 %q1;    .reg .u32 %q2;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.u32 %q1, [q1];
+    ld.param.u32 %q2, [q2];
+    ld.param.u64 %p, [p];
+    mov.u32 %cbit, 1; shl.b32 %cbit, %cbit, %q0;
+    and.b32 %cbit, %i, %cbit; setp.eq.u32 %pp, %cbit, 0; @%pp ret;
+    mov.u32 %bbit, 1; shl.b32 %bbit, %bbit, %q1;
+    and.b32 %bbit, %i, %bbit; setp.eq.u32 %pp, %bbit, 0; @%pp ret;
+    mov.u32 %cbit2, 1; shl.b32 %cbit2, %cbit2, %q2;
+    and.b32 %cbit2, %i, %cbit2; setp.ne.u32 %pp, %cbit2, 0; @%pp ret;
+    mov.u32 %bit, 1; shl.b32 %bit, %bit, %q1;
+    mov.u32 %tbit, 1; shl.b32 %tbit, %tbit, %q2;
+    or.b32 %bit, %bit, %tbit;
+    xor.b32 %j, %i, %bit;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    mul.wide.u32 %aj, %j, 8;
+    add.u64 %aj, %p, %aj;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    ld.shared.f32 %rj, [%aj];
+    ld.shared.f32 %ij, [%aj+4];
+    mov.f32 %nri, %rj; mov.f32 %nii, %ij;
+    mov.f32 %nrj, %ri; mov.f32 %nij, %ii;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+    st.shared.f32 [%aj], %nrj;
+    st.shared.f32 [%aj+4], %nij;
+}
+
+
+.func g_mcx(
+    .param .u32 i,
+    .param .u32 q0,
+    .param .u32 q1,
+    .param .u64 p
+)
+{    .reg .pred %pp;
+    .reg .u32 %bit, %j;
+    .reg .u64 %ai, %aj;
+    .reg .f32 %ri, %ii, %rj, %ij, %nri, %nii, %nrj, %nij, %t0, %u0, %v0, %w0;
+    .reg .u32 %tbit;
+    .reg .u32 %i;    .reg .u32 %q0;    .reg .u32 %q1;    .reg .u64 %p;
+    ld.param.u32 %i, [i];
+    ld.param.u32 %q0, [q0];
+    ld.param.u32 %q1, [q1];
+    ld.param.u64 %p, [p];
+    and.b32 %bit, %i, %q0;
+    setp.ne.u32 %pp, %bit, %q0; @%pp ret;
+    mov.u32 %tbit, 1; shl.b32 %tbit, %tbit, %q1;
+    and.b32 %tbit, %i, %tbit; setp.ne.u32 %pp, %tbit, 0; @%pp ret;
+    mov.u32 %bit, 1; shl.b32 %bit, %bit, %q1;
+    or.b32 %j, %i, %bit;
+    mul.wide.u32 %ai, %i, 8;
+    add.u64 %ai, %p, %ai;
+    mul.wide.u32 %aj, %j, 8;
+    add.u64 %aj, %p, %aj;
+    ld.shared.f32 %ri, [%ai];
+    ld.shared.f32 %ii, [%ai+4];
+    ld.shared.f32 %rj, [%aj];
+    ld.shared.f32 %ij, [%aj+4];
+    mov.f32 %nri, %rj; mov.f32 %nii, %ij;
+    mov.f32 %nrj, %ri; mov.f32 %nij, %ii;
+    st.shared.f32 [%ai], %nri;
+    st.shared.f32 [%ai+4], %nii;
+    st.shared.f32 [%aj], %nrj;
+    st.shared.f32 [%aj+4], %nij;
+}
+
+
+// mega: shared-memory whole-circuit kernel
+.visible .entry mega(
+    .param .u64 g_state,
+    .param .u32 N,
+    .param .u64 g_ops,
+    .param .u32 nops
+)
+{
+    .reg .pred %pp;
+    .reg .u32 %op, %nops, %N, %kind, %q0, %q1, %q2, %i, %tidr, %bdim;
+    .reg .u32 %f0i, %f1i;
+    .reg .f32 %f0, %f1, %t, %u, %zero, %one;
+    .reg .u64 %gptr, %opsptr, %sbase, %a64, %b64;
+
+    ld.param.u64 %gptr, [g_state];
+    ld.param.u32 %N, [N];
+    ld.param.u64 %opsptr, [g_ops];
+    ld.param.u32 %nops, [nops];
+
+    mov.u32 %tidr, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u64 %sbase, smem;
+    mov.f32 %zero, 0.0;
+    mov.f32 %one, 1.0;
+
+    // Reset to |0...0> in shared.
+    mov.u32 %i, %tidr;
+$zero:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $zero_done;
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %a64, %sbase, %a64;
+    st.shared.f32 [%a64], %zero;
+    st.shared.f32 [%a64+4], %zero;
+    add.u32 %i, %i, %bdim;
+    bra $zero;
+$zero_done:
+    bar.sync 0;
+    setp.ne.u32 %pp, %tidr, 0;
+    @%pp bra $after_reset;
+    st.shared.f32 [%sbase], %one;
+$after_reset:
+    bar.sync 0;
+
+    // Gate loop.
+    mov.u32 %op, 0;
+$oploop:
+    setp.ge.u32 %pp, %op, %nops;
+    @%pp bra $wb;
+
+    mul.wide.u32 %a64, %op, 32;
+    add.u64 %a64, %opsptr, %a64;
+    ld.global.u32 %kind, [%a64];
+    ld.global.u32 %q0, [%a64+4];
+    ld.global.u32 %q1, [%a64+8];
+    ld.global.u32 %q2, [%a64+12];
+    ld.global.u32 %f0i, [%a64+16];
+    ld.global.u32 %f1i, [%a64+20];
+    mov.b32 %f0, %f0i;
+    mov.b32 %f1, %f1i;
+
+    setp.eq.u32 %pp, %kind, 0; @%pp bra $k0;
+    setp.eq.u32 %pp, %kind, 1; @%pp bra $k1;
+    setp.eq.u32 %pp, %kind, 2; @%pp bra $k2;
+    setp.eq.u32 %pp, %kind, 3; @%pp bra $k3;
+    setp.eq.u32 %pp, %kind, 4; @%pp bra $k4;
+    setp.eq.u32 %pp, %kind, 5; @%pp bra $k5;
+    setp.eq.u32 %pp, %kind, 6; @%pp bra $k6;
+    setp.eq.u32 %pp, %kind, 7; @%pp bra $k7;
+    setp.eq.u32 %pp, %kind, 8; @%pp bra $k8;
+    setp.eq.u32 %pp, %kind, 9; @%pp bra $k9;
+    setp.eq.u32 %pp, %kind, 10; @%pp bra $k10;
+    setp.eq.u32 %pp, %kind, 11; @%pp bra $k11;
+    setp.eq.u32 %pp, %kind, 12; @%pp bra $k12;
+    setp.eq.u32 %pp, %kind, 13; @%pp bra $k13;
+    setp.eq.u32 %pp, %kind, 14; @%pp bra $k14;
+    setp.eq.u32 %pp, %kind, 15; @%pp bra $k15;
+    setp.eq.u32 %pp, %kind, 16; @%pp bra $k16;
+    bra $after;
+
+$k0:
+    mov.u32 %i, %tidr;
+$k0loop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $k0done;
+    call g_h, (%i, %q0, %sbase);
+    add.u32 %i, %i, %bdim;
+    bra $k0loop;
+$k0done:
+    bra $after;
+$k1:
+    mov.u32 %i, %tidr;
+$k1loop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $k1done;
+    call g_x, (%i, %q0, %sbase);
+    add.u32 %i, %i, %bdim;
+    bra $k1loop;
+$k1done:
+    bra $after;
+$k2:
+    mov.u32 %i, %tidr;
+$k2loop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $k2done;
+    call g_cnot, (%i, %q0, %q1, %sbase);
+    add.u32 %i, %i, %bdim;
+    bra $k2loop;
+$k2done:
+    bra $after;
+$k3:
+    mov.u32 %i, %tidr;
+$k3loop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $k3done;
+    call g_toff, (%i, %q0, %q1, %q2, %sbase);
+    add.u32 %i, %i, %bdim;
+    bra $k3loop;
+$k3done:
+    bra $after;
+$k4:
+    mov.u32 %i, %tidr;
+$k4loop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $k4done;
+    call g_rz, (%i, %q0, %f0, %f1, %sbase);
+    add.u32 %i, %i, %bdim;
+    bra $k4loop;
+$k4done:
+    bra $after;
+$k5:
+    mov.u32 %i, %tidr;
+$k5loop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $k5done;
+    call g_rx, (%i, %q0, %f0, %f1, %sbase);
+    add.u32 %i, %i, %bdim;
+    bra $k5loop;
+$k5done:
+    bra $after;
+$k6:
+    mov.u32 %i, %tidr;
+$k6loop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $k6done;
+    call g_ry, (%i, %q0, %f0, %f1, %sbase);
+    add.u32 %i, %i, %bdim;
+    bra $k6loop;
+$k6done:
+    bra $after;
+$k7:
+    mov.u32 %i, %tidr;
+$k7loop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $k7done;
+    call g_phase, (%i, %q0, %f0, %f1, %sbase);
+    add.u32 %i, %i, %bdim;
+    bra $k7loop;
+$k7done:
+    bra $after;
+$k8:
+    mov.u32 %i, %tidr;
+$k8loop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $k8done;
+    call g_s, (%i, %q0, %sbase);
+    add.u32 %i, %i, %bdim;
+    bra $k8loop;
+$k8done:
+    bra $after;
+$k9:
+    mov.u32 %i, %tidr;
+$k9loop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $k9done;
+    call g_t, (%i, %q0, %sbase);
+    add.u32 %i, %i, %bdim;
+    bra $k9loop;
+$k9done:
+    bra $after;
+$k10:
+    mov.u32 %i, %tidr;
+$k10loop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $k10done;
+    call g_sx, (%i, %q0, %sbase);
+    add.u32 %i, %i, %bdim;
+    bra $k10loop;
+$k10done:
+    bra $after;
+$k11:
+    mov.u32 %i, %tidr;
+$k11loop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $k11done;
+    call g_swap, (%i, %q0, %q1, %sbase);
+    add.u32 %i, %i, %bdim;
+    bra $k11loop;
+$k11done:
+    bra $after;
+$k12:
+    mov.u32 %i, %tidr;
+$k12loop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $k12done;
+    call g_iswap, (%i, %q0, %q1, %sbase);
+    add.u32 %i, %i, %bdim;
+    bra $k12loop;
+$k12done:
+    bra $after;
+$k13:
+    mov.u32 %i, %tidr;
+$k13loop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $k13done;
+    call g_cz, (%i, %q0, %q1, %sbase);
+    add.u32 %i, %i, %bdim;
+    bra $k13loop;
+$k13done:
+    bra $after;
+$k14:
+    mov.u32 %i, %tidr;
+$k14loop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $k14done;
+    call g_cphase, (%i, %q0, %q1, %f0, %f1, %sbase);
+    add.u32 %i, %i, %bdim;
+    bra $k14loop;
+$k14done:
+    bra $after;
+$k15:
+    mov.u32 %i, %tidr;
+$k15loop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $k15done;
+    call g_cswap, (%i, %q0, %q1, %q2, %sbase);
+    add.u32 %i, %i, %bdim;
+    bra $k15loop;
+$k15done:
+    bra $after;
+$k16:
+    mov.u32 %i, %tidr;
+$k16loop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $k16done;
+    call g_mcx, (%i, %q0, %q1, %sbase);
+    add.u32 %i, %i, %bdim;
+    bra $k16loop;
+$k16done:
+    bra $after;
+
+$after:
+    bar.sync 0;
+    add.u32 %op, %op, 1;
+    bra $oploop;
+
+$wb:
+    // Write shared back to global.
+    mov.u32 %i, %tidr;
+$wbloop:
+    setp.ge.u32 %pp, %i, %N;
+    @%pp bra $done;
+    mul.wide.u32 %a64, %i, 8;
+    add.u64 %a64, %sbase, %a64;
+    ld.shared.f32 %t, [%a64];
+    ld.shared.f32 %u, [%a64+4];
+    mul.wide.u32 %b64, %i, 8;
+    add.u64 %b64, %gptr, %b64;
+    st.global.f32 [%b64], %t;
+    st.global.f32 [%b64+4], %u;
+    add.u32 %i, %i, %bdim;
+    bra $wbloop;
+$done:
+    ret;
+}
+
+// EXPECT: <psi|P|psi> via the deterministic two-stage reduction
+// P encoded as 2 bits/qubit (I=00,X=01,Y=10,Z=11). Host passes flip (X/Y
+// qubits), z-mask, y-mask, and ybase = (-i)^|Y| as f32. Each thread
+// accumulates conj(a_i)*c(i)*a_{i^flip} over its strided indices into
+// COMPENSATED (Kahan) (hi, lo) accumulators for the real and imaginary
+// parts; per-block partials are summed in fixed order, then expect_finalize
+// sums in block order - same determinism contract as prob, with the
+// O(sqrt(n)) summation drift removed.
+.shared .align 4 .b32 sdata_exre[512];
+.shared .align 4 .b32 sdata_exim[512];
+
+.visible .entry expect_partial(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u32 flip,
+    .param .u32 zmask,
+    .param .u32 ymask,
+    .param .f32 yb_re,
+    .param .f32 yb_im,
+    .param .u64 scratch
+)
+{
+    .reg .u64 %ptr, %scrptr, %addr_i, %addr_j, %a64, %saddr, %sbase;
+    .reg .u32 %n, %gtid, %total, %off, %j, %par;
+    .reg .u32 %flip, %zm, %ym, %blk, %bdx, %tix, %gdx;
+    .reg .f32 %re_i, %im_i, %re_j, %im_j, %c_r, %c_i, %pr, %pi, %t, %u;
+    .reg .f32 %yb_r, %yb_i, %tr, %ti, %y, %sum;
+    .reg .f32 %rhi, %rlo, %ihi, %ilo;
+    .reg .pred %p;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u32 %flip, [flip];
+    ld.param.u32 %zm, [zmask];
+    ld.param.u32 %ym, [ymask];
+    ld.param.f32 %yb_r, [yb_re];
+    ld.param.f32 %yb_i, [yb_im];
+    ld.param.u64 %scrptr, [scratch];
+
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    mov.u32 %gdx, %nctaid.x;
+    mov.u32 %gtid, %blk;
+    mad.lo.u32 %gtid, %gtid, %bdx, %tix;
+    mov.u32 %total, %gdx;
+    mul.lo.u32 %total, %total, %bdx;
+
+    mov.f32 %rhi, 0.0; mov.f32 %rlo, 0.0;
+    mov.f32 %ihi, 0.0; mov.f32 %ilo, 0.0;
+
+$loop:
+    setp.ge.u32 %p, %gtid, %n;
+    @%p bra $reduce;
+
+    mov.u32 %j, %gtid;
+    xor.b32 %j, %j, %flip;
+
+    mov.f32 %c_r, %yb_r;
+    mov.f32 %c_i, %yb_i;
+    and.b32 %off, %gtid, %zm;
+    popc.b32 %par, %off;
+    and.b32 %par, %par, 1;
+    setp.eq.u32 %p, %par, 1;
+    @%p neg.f32 %c_r, %c_r;
+    @%p neg.f32 %c_i, %c_i;
+    and.b32 %off, %gtid, %ym;
+    popc.b32 %par, %off;
+    and.b32 %par, %par, 1;
+    setp.eq.u32 %p, %par, 1;
+    @%p neg.f32 %c_r, %c_r;
+    @%p neg.f32 %c_i, %c_i;
+
+    mul.wide.u32 %a64, %gtid, 8;
+    add.u64 %addr_i, %ptr, %a64;
+    mul.wide.u32 %a64, %j, 8;
+    add.u64 %addr_j, %ptr, %a64;
+    ld.global.f32 %re_i, [%addr_i];
+    ld.global.f32 %im_i, [%addr_i+4];
+    ld.global.f32 %re_j, [%addr_j];
+    ld.global.f32 %im_j, [%addr_j+4];
+
+    mul.f32 %pr, %re_i, %re_j;
+    mul.f32 %u, %im_i, %im_j;
+    add.f32 %pr, %pr, %u;
+    mul.f32 %pi, %re_i, %im_j;
+    mul.f32 %u, %im_i, %re_j;
+    sub.f32 %pi, %pi, %u;
+
+    // tr = c_r*pr - c_i*pi ; ti = c_r*pi + c_i*pr
+    mul.f32 %t, %c_r, %pr;
+    mul.f32 %u, %c_i, %pi;
+    sub.f32 %tr, %t, %u;
+    mul.f32 %t, %c_r, %pi;
+    mul.f32 %u, %c_i, %pr;
+    add.f32 %ti, %t, %u;
+
+    // Kahan: real accumulator += tr
+    sub.f32 %y, %tr, %rlo;
+    add.f32 %sum, %rhi, %y;
+    sub.f32 %rlo, %sum, %rhi;
+    sub.f32 %rlo, %rlo, %y;
+    mov.f32 %rhi, %sum;
+    // Kahan: imag accumulator += ti
+    sub.f32 %y, %ti, %ilo;
+    add.f32 %sum, %ihi, %y;
+    sub.f32 %ilo, %sum, %ihi;
+    sub.f32 %ilo, %ilo, %y;
+    mov.f32 %ihi, %sum;
+
+$next:
+    add.u32 %gtid, %gtid, %total;
+    bra $loop;
+
+$reduce:
+    mov.u64 %sbase, sdata_exre;
+    mul.wide.u32 %a64, %tix, 8;
+    add.u64 %saddr, %sbase, %a64;
+    st.shared.f32 [%saddr], %rhi;
+    st.shared.f32 [%saddr+4], %rlo;
+    mov.u64 %sbase, sdata_exim;
+    add.u64 %saddr, %sbase, %a64;
+    st.shared.f32 [%saddr], %ihi;
+    st.shared.f32 [%saddr+4], %ilo;
+    bar.sync 0;
+
+    setp.ne.u32 %p, %tix, 0;
+    @%p bra $done;
+
+    mov.f32 %rhi, 0.0; mov.f32 %rlo, 0.0;
+    mov.f32 %ihi, 0.0; mov.f32 %ilo, 0.0;
+    mov.u32 %off, 0;
+$bsum:
+    setp.ge.u32 %p, %off, %bdx;
+    @%p bra $write;
+    mul.wide.u32 %a64, %off, 8;
+    mov.u64 %sbase, sdata_exre;
+    add.u64 %saddr, %sbase, %a64;
+    ld.shared.f32 %t, [%saddr];
+    sub.f32 %y, %t, %rlo;
+    add.f32 %sum, %rhi, %y;
+    sub.f32 %rlo, %sum, %rhi;
+    sub.f32 %rlo, %rlo, %y;
+    mov.f32 %rhi, %sum;
+    ld.shared.f32 %t, [%saddr+4];
+    sub.f32 %y, %t, %rlo;
+    add.f32 %sum, %rhi, %y;
+    sub.f32 %rlo, %sum, %rhi;
+    sub.f32 %rlo, %rlo, %y;
+    mov.f32 %rhi, %sum;
+    mov.u64 %sbase, sdata_exim;
+    add.u64 %saddr, %sbase, %a64;
+    ld.shared.f32 %t, [%saddr];
+    sub.f32 %y, %t, %ilo;
+    add.f32 %sum, %ihi, %y;
+    sub.f32 %ilo, %sum, %ihi;
+    sub.f32 %ilo, %ilo, %y;
+    mov.f32 %ihi, %sum;
+    ld.shared.f32 %t, [%saddr+4];
+    sub.f32 %y, %t, %ilo;
+    add.f32 %sum, %ihi, %y;
+    sub.f32 %ilo, %sum, %ihi;
+    sub.f32 %ilo, %ilo, %y;
+    mov.f32 %ihi, %sum;
+    add.u32 %off, %off, 1;
+    bra $bsum;
+
+$write:
+    mul.wide.u32 %a64, %blk, 16;
+    add.u64 %addr_i, %scrptr, %a64;
+    st.global.f32 [%addr_i], %rhi;
+    st.global.f32 [%addr_i+4], %rlo;
+    st.global.f32 [%addr_i+8], %ihi;
+    st.global.f32 [%addr_i+12], %ilo;
+$done:
+    ret;
+}
+
+.visible .entry expect_finalize(
+    .param .u64 scratch,
+    .param .u32 nblocks,
+    .param .u64 out
+)
+{
+    .reg .u64 %scrptr, %outptr, %addr, %a64, %saddr, %sbase;
+    .reg .u32 %nblk, %tidr, %bdx, %chunk, %start, %end, %off;
+    .reg .f32 %rhi, %rlo, %ihi, %ilo, %t, %y, %sum;
+    .reg .pred %p;
+
+    ld.param.u64 %scrptr, [scratch];
+    ld.param.u32 %nblk, [nblocks];
+    ld.param.u64 %outptr, [out];
+
+    mov.u32 %tidr, %tid.x;
+    mov.u32 %bdx, %ntid.x;
+
+    mov.u32 %chunk, %nblk;
+    add.u32 %chunk, %chunk, 255;
+    shr.u32 %chunk, %chunk, 8;
+
+    mul.lo.u32 %start, %tidr, %chunk;
+    mov.u32 %end, %start;
+    add.u32 %end, %end, %chunk;
+    setp.ge.u32 %p, %end, %nblk;
+    @%p mov.u32 %end, %nblk;
+
+    mov.f32 %rhi, 0.0; mov.f32 %rlo, 0.0;
+    mov.f32 %ihi, 0.0; mov.f32 %ilo, 0.0;
+    mov.u32 %off, %start;
+$loop:
+    setp.ge.u32 %p, %off, %end;
+    @%p bra $reduce;
+    mul.wide.u32 %a64, %off, 16;
+    add.u64 %addr, %scrptr, %a64;
+    ld.global.f32 %t, [%addr];
+    sub.f32 %y, %t, %rlo;
+    add.f32 %sum, %rhi, %y;
+    sub.f32 %rlo, %sum, %rhi;
+    sub.f32 %rlo, %rlo, %y;
+    mov.f32 %rhi, %sum;
+    ld.global.f32 %t, [%addr+4];
+    sub.f32 %y, %t, %rlo;
+    add.f32 %sum, %rhi, %y;
+    sub.f32 %rlo, %sum, %rhi;
+    sub.f32 %rlo, %rlo, %y;
+    mov.f32 %rhi, %sum;
+    ld.global.f32 %t, [%addr+8];
+    sub.f32 %y, %t, %ilo;
+    add.f32 %sum, %ihi, %y;
+    sub.f32 %ilo, %sum, %ihi;
+    sub.f32 %ilo, %ilo, %y;
+    mov.f32 %ihi, %sum;
+    ld.global.f32 %t, [%addr+12];
+    sub.f32 %y, %t, %ilo;
+    add.f32 %sum, %ihi, %y;
+    sub.f32 %ilo, %sum, %ihi;
+    sub.f32 %ilo, %ilo, %y;
+    mov.f32 %ihi, %sum;
+    add.u32 %off, %off, 1;
+    bra $loop;
+
+$reduce:
+    mov.u64 %sbase, sdata_exre;
+    mul.wide.u32 %a64, %tidr, 8;
+    add.u64 %saddr, %sbase, %a64;
+    st.shared.f32 [%saddr], %rhi;
+    st.shared.f32 [%saddr+4], %rlo;
+    mov.u64 %sbase, sdata_exim;
+    add.u64 %saddr, %sbase, %a64;
+    st.shared.f32 [%saddr], %ihi;
+    st.shared.f32 [%saddr+4], %ilo;
+    bar.sync 0;
+    setp.ne.u32 %p, %tidr, 0;
+    @%p bra $done;
+    mov.f32 %rhi, 0.0; mov.f32 %rlo, 0.0;
+    mov.f32 %ihi, 0.0; mov.f32 %ilo, 0.0;
+    mov.u32 %off, 0;
+$bsum:
+    setp.ge.u32 %p, %off, %bdx;
+    @%p bra $write;
+    mul.wide.u32 %a64, %off, 8;
+    mov.u64 %sbase, sdata_exre;
+    add.u64 %saddr, %sbase, %a64;
+    ld.shared.f32 %t, [%saddr];
+    sub.f32 %y, %t, %rlo;
+    add.f32 %sum, %rhi, %y;
+    sub.f32 %rlo, %sum, %rhi;
+    sub.f32 %rlo, %rlo, %y;
+    mov.f32 %rhi, %sum;
+    ld.shared.f32 %t, [%saddr+4];
+    sub.f32 %y, %t, %rlo;
+    add.f32 %sum, %rhi, %y;
+    sub.f32 %rlo, %sum, %rhi;
+    sub.f32 %rlo, %rlo, %y;
+    mov.f32 %rhi, %sum;
+    mov.u64 %sbase, sdata_exim;
+    add.u64 %saddr, %sbase, %a64;
+    ld.shared.f32 %t, [%saddr];
+    sub.f32 %y, %t, %ilo;
+    add.f32 %sum, %ihi, %y;
+    sub.f32 %ilo, %sum, %ihi;
+    sub.f32 %ilo, %ilo, %y;
+    mov.f32 %ihi, %sum;
+    ld.shared.f32 %t, [%saddr+4];
+    sub.f32 %y, %t, %ilo;
+    add.f32 %sum, %ihi, %y;
+    sub.f32 %ilo, %sum, %ihi;
+    sub.f32 %ilo, %ilo, %y;
+    mov.f32 %ihi, %sum;
+    add.u32 %off, %off, 1;
+    bra $bsum;
+
+$write:
+    add.f32 %t, %rhi, %rlo;
+    st.global.f32 [%outptr], %t;
+    add.f32 %t, %ihi, %ilo;
+    st.global.f32 [%outptr+4], %t;
+$done:
+    ret;
+}
+
+// mma_u2_lowpair: batched 4x4 unitary via tensor cores.
+// Experimental, not loaded by the Rust backend; restricted to gates on qubits {0,1}.
+// Applies a fused 2-qubit unitary U (4x4 complex) to every 4-block of the
+// state, for gates on qubits {0,1} (blocks are contiguous groups of 4
+// amplitudes). Each warp processes tiles of 8 blocks (32 amplitudes).
+//
+// Complex product with real mma (K=8):
+//   A1 = [U_r | -U_i]  (16x8), A2 = [U_i | U_r]
+//   B  = [in_r; in_i]  (8x8, col = block)
+//   out_r = A1*B, out_i = A2*B.
+// The gate buffer g holds 256 f32: A1 (16x8 row-major) then A2 (16x8).
+// Fragment layout (m16n8k8 row.col tf32): per lane with g=lane>>2, t=lane%4:
+//   a0=A[g][t] a1=A[g+8][t] a2=A[g][t+4] a3=A[g+8][t+4]
+//   b0=B[t][g] b1=B[t+4][g]
+//   c0=D[g][2t] c1=D[g][2t+1] c2=D[g+8][2t] c3=D[g+8][2t+1]
+// Only rows 0..3 of D are meaningful (A rows 4..15 are zero); lanes with
+// g in 0..3 hold them in c0/c1.
+.visible .entry mma_u2_lowpair(
+    .param .u64 s,
+    .param .u32 N,
+    .param .u64 g,
+    .param .u32 ntiles
+)
+{
+    .reg .u64 %ptr, %gptr, %a64, %addr;
+    .reg .u32 %lane, %g, %t, %tile, %ntiles, %n, %idx, %idx2, %warps_per_block, %warp_local, %warp_global, %total_warps;
+    .reg .u32 %blk, %bdx, %tix;
+    .reg .b32 %a1_0, %a1_1, %a1_2, %a1_3, %a2_0, %a2_1, %a2_2, %a2_3;
+    .reg .b32 %b0, %b1;
+    .reg .b32 %t0, %t1, %t2, %t3, %t4, %t5, %t6, %t7, %t8, %t9;
+    .reg .f32 %d1_0, %d1_1, %d1_2, %d1_3, %d2_0, %d2_1, %d2_2, %d2_3;
+    .reg .f32 %re0, %im0;
+    .reg .pred %p;
+
+    ld.param.u64 %ptr, [s];
+    ld.param.u32 %n, [N];
+    ld.param.u64 %gptr, [g];
+    ld.param.u32 %ntiles, [ntiles];
+
+    mov.u32 %lane, %laneid;
+    mov.u32 %g, %lane;
+    shr.u32 %g, %g, 2;
+    mov.u32 %t, %lane;
+    and.b32 %t, %t, 3;
+
+    // Load A1 fragment: A1[r][c] = g[r*8 + c].
+    // a0=A1[g][t] a1=A1[g+8][t] a2=A1[g][t+4] a3=A1[g+8][t+4]
+    mov.u32 %idx, %g;
+    mul.lo.u32 %idx, %idx, 8;
+    add.u32 %idx, %idx, %t;
+    mul.wide.u32 %a64, %idx, 4;
+    add.u64 %addr, %gptr, %a64;
+    ld.global.f32 %re0, [%addr];
+    cvt.rna.tf32.f32 %t0, %re0;
+    mov.b32 %a1_0, %t0;
+
+    mov.u32 %idx, %g;
+    add.u32 %idx, %idx, 8;
+    mul.lo.u32 %idx, %idx, 8;
+    add.u32 %idx, %idx, %t;
+    mul.wide.u32 %a64, %idx, 4;
+    add.u64 %addr, %gptr, %a64;
+    ld.global.f32 %re0, [%addr];
+    cvt.rna.tf32.f32 %t0, %re0;
+    mov.b32 %a1_1, %t0;
+
+    mov.u32 %idx, %g;
+    mul.lo.u32 %idx, %idx, 8;
+    add.u32 %idx, %idx, %t;
+    add.u32 %idx, %idx, 4;
+    mul.wide.u32 %a64, %idx, 4;
+    add.u64 %addr, %gptr, %a64;
+    ld.global.f32 %re0, [%addr];
+    cvt.rna.tf32.f32 %t0, %re0;
+    mov.b32 %a1_2, %t0;
+
+    mov.u32 %idx, %g;
+    add.u32 %idx, %idx, 8;
+    mul.lo.u32 %idx, %idx, 8;
+    add.u32 %idx, %idx, %t;
+    add.u32 %idx, %idx, 4;
+    mul.wide.u32 %a64, %idx, 4;
+    add.u64 %addr, %gptr, %a64;
+    ld.global.f32 %re0, [%addr];
+    cvt.rna.tf32.f32 %t0, %re0;
+    mov.b32 %a1_3, %t0;
+
+    // A2 fragment at g + 128 (16x8 = 128 f32).
+    mov.u64 %gptr, %gptr;
+    mov.u32 %idx, %g;
+    mul.lo.u32 %idx, %idx, 8;
+    add.u32 %idx, %idx, %t;
+    add.u32 %idx, %idx, 128;
+    mul.wide.u32 %a64, %idx, 4;
+    add.u64 %addr, %gptr, %a64;
+    ld.global.f32 %re0, [%addr];
+    cvt.rna.tf32.f32 %t0, %re0;
+    mov.b32 %a2_0, %t0;
+
+    mov.u32 %idx, %g;
+    add.u32 %idx, %idx, 8;
+    mul.lo.u32 %idx, %idx, 8;
+    add.u32 %idx, %idx, %t;
+    add.u32 %idx, %idx, 128;
+    mul.wide.u32 %a64, %idx, 4;
+    add.u64 %addr, %gptr, %a64;
+    ld.global.f32 %re0, [%addr];
+    cvt.rna.tf32.f32 %t0, %re0;
+    mov.b32 %a2_1, %t0;
+
+    mov.u32 %idx, %g;
+    mul.lo.u32 %idx, %idx, 8;
+    add.u32 %idx, %idx, %t;
+    add.u32 %idx, %idx, 4;
+    add.u32 %idx, %idx, 128;
+    mul.wide.u32 %a64, %idx, 4;
+    add.u64 %addr, %gptr, %a64;
+    ld.global.f32 %re0, [%addr];
+    cvt.rna.tf32.f32 %t0, %re0;
+    mov.b32 %a2_2, %t0;
+
+    mov.u32 %idx, %g;
+    add.u32 %idx, %idx, 8;
+    mul.lo.u32 %idx, %idx, 8;
+    add.u32 %idx, %idx, %t;
+    add.u32 %idx, %idx, 4;
+    add.u32 %idx, %idx, 128;
+    mul.wide.u32 %a64, %idx, 4;
+    add.u64 %addr, %gptr, %a64;
+    ld.global.f32 %re0, [%addr];
+    cvt.rna.tf32.f32 %t0, %re0;
+    mov.b32 %a2_3, %t0;
+
+    // Warp grid-stride over tiles.
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %bdx, %ntid.x;
+    mov.u32 %tix, %tid.x;
+    shr.u32 %warp_local, %tix, 5;
+    mov.u32 %warps_per_block, %bdx;
+    shr.u32 %warps_per_block, %warps_per_block, 5;
+    mul.lo.u32 %warp_global, %blk, %warps_per_block;
+    add.u32 %warp_global, %warp_global, %warp_local;
+    mov.u32 %total_warps, %nctaid.x;
+    mul.lo.u32 %total_warps, %total_warps, %warps_per_block;
+
+    mov.u32 %tile, %warp_global;
+$tileloop:
+    setp.ge.u32 %p, %tile, %ntiles;
+    @%p bra $done;
+
+    // Load B fragment: block = g (0..7 within tile), row = t.
+    // base block of this tile = tile*8. index = (tile*8 + g)*4 + t.
+    // re -> b0, im -> b1.
+    mov.u32 %idx, %tile;
+    shl.b32 %idx, %idx, 3;
+    add.u32 %idx, %idx, %g;
+    shl.b32 %idx, %idx, 2;
+    add.u32 %idx, %idx, %t;
+    mul.wide.u32 %a64, %idx, 8;
+    add.u64 %addr, %ptr, %a64;
+    ld.global.f32 %re0, [%addr];
+    ld.global.f32 %im0, [%addr+4];
+    cvt.rna.tf32.f32 %t0, %re0;
+    mov.b32 %b0, %t0;
+    cvt.rna.tf32.f32 %t0, %im0;
+    mov.b32 %b1, %t0;
+
+    // out_r = A1*B, out_i = A2*B. C = 0.
+    mov.f32 %d1_0, 0.0; mov.f32 %d1_1, 0.0; mov.f32 %d1_2, 0.0; mov.f32 %d1_3, 0.0;
+    mov.f32 %d2_0, 0.0; mov.f32 %d2_1, 0.0; mov.f32 %d2_2, 0.0; mov.f32 %d2_3, 0.0;
+    mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 { %d1_0, %d1_1, %d1_2, %d1_3 }, { %a1_0, %a1_1, %a1_2, %a1_3 }, { %b0, %b1 }, { %d1_0, %d1_1, %d1_2, %d1_3 };
+    mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 { %d2_0, %d2_1, %d2_2, %d2_3 }, { %a2_0, %a2_1, %a2_2, %a2_3 }, { %b0, %b1 }, { %d2_0, %d2_1, %d2_2, %d2_3 };
+
+    // Write rows 0..3: lane with g < 4 holds out row g, blocks 2t, 2t+1.
+    setp.ge.u32 %p, %g, 4;
+    @%p bra $tileadv;
+    // block 2t: index = (tile*8 + 2t)*4 + g
+    mov.u32 %idx, %tile;
+    shl.b32 %idx, %idx, 3;
+    mov.u32 %idx2, %t;
+    shl.b32 %idx2, %idx2, 1;
+    add.u32 %idx, %idx, %idx2;
+    shl.b32 %idx, %idx, 2;
+    add.u32 %idx, %idx, %g;
+    mul.wide.u32 %a64, %idx, 8;
+    add.u64 %addr, %ptr, %a64;
+    st.global.f32 [%addr], %d1_0;
+    st.global.f32 [%addr+4], %d2_0;
+    // block 2t+1: index = (tile*8 + 2t + 1)*4 + g
+    mov.u32 %idx, %tile;
+    shl.b32 %idx, %idx, 3;
+    mov.u32 %idx2, %t;
+    shl.b32 %idx2, %idx2, 1;
+    add.u32 %idx, %idx, %idx2;
+    add.u32 %idx, %idx, 1;
+    shl.b32 %idx, %idx, 2;
+    add.u32 %idx, %idx, %g;
+    mul.wide.u32 %a64, %idx, 8;
+    add.u64 %addr, %ptr, %a64;
+    st.global.f32 [%addr], %d1_1;
+    st.global.f32 [%addr+4], %d2_1;
+$tileadv:
+    add.u32 %tile, %tile, %total_warps;
+    bra $tileloop;
 $done:
     ret;
 }

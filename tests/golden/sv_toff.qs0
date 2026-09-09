@@ -1,0 +1,5 @@
+QUBITS 3
+X 0
+X 1
+TOFF 0 1 2
+PRINT

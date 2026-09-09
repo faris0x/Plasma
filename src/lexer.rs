@@ -5,7 +5,7 @@ pub const MAX_TOKENS: usize = 16384;
 
 use super::diag::Diag;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 #[repr(u8)]
 pub enum Token {
     // Keywords
@@ -23,11 +23,56 @@ pub enum Token {
     Print,
     End,
     Halt,
+    // v0.2 keywords (appended; v0.1 discriminants unchanged)
+    Rz,
+    Rx,
+    Ry,
+    Phase,
+    S,
+    T,
+    Sx,
+    Swap,
+    Iswap,
+    Cz,
+    Cphase,
+    Cswap,
+    Mcx,
+    Reset,
+    MeasureX,
+    MeasureY,
+    Set,
+    Not,
+    And,
+    Or,
+    Xor,
+    Add,
+    Sub,
+    // v0.2 observables
+    Expect,
+    Estimate,
+    SaveState,
+    SaveAmps,
+    SaveProbs,
+    // Subroutines
+    Gate,
+    Endgate,
+    /// A user-defined gate name (call site): any word that is not a keyword
+    /// and not a Pauli product.
+    Ident,
     // Values and symbols
     Number(u32),
+    /// v0.2 decimal angle literal.
+    Float(f64),
+    /// v0.2 Pauli product like `Z0X1`, encoded as 2 bits per qubit
+    /// (I=00, X=01, Y=10, Z=11; qubit q at bits 2q..2q+1).
+    Pauli(u64),
     ClassicalRef(u32),
     Arrow,
+    /// Unary minus for negative ESTIMATE coefficients.
+    Minus,
     Equals,
+    /// v0.2 `!=` (not-equals).
+    Ne,
     Newline,
     Eof,
     Error,
@@ -44,6 +89,13 @@ pub struct LexResult {
     pub token_cols: [u16; MAX_TOKENS],
     /// Details of the lexer error, if `error` is set.
     pub diag: Diag,
+    /// Identifier (gate name) storage: for each `Token::Ident` at token index
+    /// `p`, the name lives in `ident_buf[ident_offs[p] .. ident_offs[p]+ident_lens[p]]`.
+    /// Needed because the parser defers sub-program bodies to a second pass.
+    pub ident_offs: [u32; MAX_TOKENS],
+    pub ident_lens: [u16; MAX_TOKENS],
+    pub ident_buf: [u8; 4096],
+    pub ident_len: usize,
 }
 
 impl LexResult {
@@ -55,6 +107,10 @@ impl LexResult {
             token_lines: [1; MAX_TOKENS],
             token_cols: [1; MAX_TOKENS],
             diag: Diag::new(),
+            ident_offs: [0; MAX_TOKENS],
+            ident_lens: [0; MAX_TOKENS],
+            ident_buf: [0; 4096],
+            ident_len: 0,
         }
     }
 
@@ -62,6 +118,14 @@ impl LexResult {
         self.count = 0;
         self.error = false;
         self.diag.clear();
+        self.ident_len = 0;
+    }
+
+    /// The identifier (gate name) at token index `p`, if it is `Token::Ident`.
+    pub fn ident_at(&self, p: usize) -> &[u8] {
+        let off = self.ident_offs[p] as usize;
+        let len = self.ident_lens[p] as usize;
+        &self.ident_buf[off..off + len]
     }
 }
 
@@ -101,20 +165,37 @@ pub fn tokenise(input: &[u8], result: &mut LexResult) {
             continue;
         }
 
-        // Digits
+        // Digits (and v0.2 decimals: digits '.' digits)
         if byte.is_ascii_digit() {
             let start_col = col;
-            let mut val: u32 = 0;
+            let mut int: u64 = 0;
             while cursor < input.len() && input[cursor].is_ascii_digit() {
-                val = val.wrapping_mul(10).wrapping_add((input[cursor] - b'0') as u32);
+                int = int.wrapping_mul(10).wrapping_add((input[cursor] - b'0') as u64);
                 cursor += 1;
                 col += 1;
             }
-            append(result, Token::Number(val), line, start_col);
+            // Decimal point: lex as Float.
+            if cursor + 1 < input.len() && input[cursor] == b'.'
+                && input[cursor + 1].is_ascii_digit()
+            {
+                cursor += 1;
+                col += 1;
+                let mut frac = 0.0f64;
+                let mut scale = 0.1f64;
+                while cursor < input.len() && input[cursor].is_ascii_digit() {
+                    frac += (input[cursor] - b'0') as f64 * scale;
+                    scale *= 0.1;
+                    cursor += 1;
+                    col += 1;
+                }
+                append(result, Token::Float(int as f64 + frac), line, start_col);
+            } else {
+                append(result, Token::Number(int as u32), line, start_col);
+            }
             continue;
         }
 
-        // Classical reference (c0, c1, ...) — must precede identifier check
+        // Classical reference (c0, c1, ...), must precede identifier check
         // because 'c' is alphabetic and would be caught as a keyword.
         if byte == b'c' && cursor + 1 < input.len() && input[cursor + 1].is_ascii_digit() {
             let start_col = col;
@@ -130,20 +211,42 @@ pub fn tokenise(input: &[u8], result: &mut LexResult) {
             continue;
         }
 
-        // Identifiers (keywords)
+        // Identifiers (keywords); `_` allowed so multi-word keywords like
+        // MEASURE_X lex as a single token.
         if byte.is_ascii_alphabetic() {
             let start_col = col;
             let start = cursor;
-            while cursor < input.len() && input[cursor].is_ascii_alphanumeric() {
+            while cursor < input.len()
+                && (input[cursor].is_ascii_alphanumeric() || input[cursor] == b'_')
+            {
                 cursor += 1;
                 col += 1;
             }
             let word = &input[start..cursor];
+            // A Pauli product (e.g. `Z0X1`) lexes as a single token. This must
+            // be checked before keyword matching, but a bare `X` (a gate) is
+            // not a Pauli term (a term needs a qubit digit), so gates are
+            // unaffected.
+            if let Some(code) = parse_pauli(word) {
+                append(result, Token::Pauli(code), line, start_col);
+                continue;
+            }
             let token = match_keyword(word);
             if token == Token::Error {
-                result.error = true;
-                result.diag.set(line, start_col, "unknown keyword");
-                return;
+                // Not a keyword: it is either a user-defined gate name
+                // (call site) or a genuinely unknown word (parser reports
+                // "undefined gate"). Store the name for the deferred
+                // sub-program pass.
+                let ident = &input[start..cursor];
+                if result.ident_len + ident.len() <= 4096 {
+                    result.ident_offs[result.count] = result.ident_len as u32;
+                    result.ident_lens[result.count] = ident.len() as u16;
+                    result.ident_buf[result.ident_len..result.ident_len + ident.len()]
+                        .copy_from_slice(ident);
+                    result.ident_len += ident.len();
+                }
+                append(result, Token::Ident, line, start_col);
+                continue;
             }
             append(result, token, line, start_col);
             continue;
@@ -156,6 +259,11 @@ pub fn tokenise(input: &[u8], result: &mut LexResult) {
                 cursor += 2;
                 col += 2;
             }
+            b'-' => {
+                append(result, Token::Minus, line, col);
+                cursor += 1;
+                col += 1;
+            }
             b'=' => {
                 append(result, Token::Equals, line, col);
                 cursor += 1;
@@ -164,6 +272,17 @@ pub fn tokenise(input: &[u8], result: &mut LexResult) {
                 if cursor < input.len() && input[cursor] == b'=' {
                     cursor += 1;
                     col += 1;
+                }
+            }
+            b'!' => {
+                if cursor + 1 < input.len() && input[cursor + 1] == b'=' {
+                    append(result, Token::Ne, line, col);
+                    cursor += 2;
+                    col += 2;
+                } else {
+                    result.error = true;
+                    result.diag.set(line, col, "unexpected character");
+                    return;
                 }
             }
             _ => {
@@ -183,6 +302,41 @@ pub fn tokenise(input: &[u8], result: &mut LexResult) {
     }
 }
 
+/// Parse a Pauli product word like `Z0X1` into a 2-bits-per-qubit code
+/// (I=00, X=01, Y=10, Z=11). Every term must be `[IXYZ]<qubit>`. Returns
+/// None if the word is not a valid Pauli product (e.g. a bare gate keyword).
+fn parse_pauli(word: &[u8]) -> Option<u64> {
+    let mut code = 0u64;
+    let mut i = 0;
+    let mut any = false;
+    while i < word.len() {
+        let pv = match word[i] {
+            b'I' => 0u64,
+            b'X' => 1u64,
+            b'Y' => 2u64,
+            b'Z' => 3u64,
+            _ => return None,
+        };
+        i += 1;
+        let dstart = i;
+        let mut q: u64 = 0;
+        while i < word.len() && word[i].is_ascii_digit() {
+            q = q.wrapping_mul(10).wrapping_add((word[i] - b'0') as u64);
+            i += 1;
+        }
+        if i == dstart || q > 31 {
+            return None; // term without a qubit, or a qubit that overflows
+        }
+        code |= pv << (2 * q);
+        any = true;
+    }
+    if any {
+        Some(code)
+    } else {
+        None
+    }
+}
+
 fn match_keyword(word: &[u8]) -> Token {
     match word {
         b"QUBITS" => Token::Qubits,
@@ -199,6 +353,39 @@ fn match_keyword(word: &[u8]) -> Token {
         b"PRINT" => Token::Print,
         b"END" => Token::End,
         b"HALT" => Token::Halt,
+        // v0.2
+        b"RZ" => Token::Rz,
+        b"RX" => Token::Rx,
+        b"RY" => Token::Ry,
+        b"PHASE" => Token::Phase,
+        b"S" => Token::S,
+        b"T" => Token::T,
+        b"SX" => Token::Sx,
+        b"SWAP" => Token::Swap,
+        b"ISWAP" => Token::Iswap,
+        b"CZ" => Token::Cz,
+        b"CPHASE" => Token::Cphase,
+        b"CSWAP" => Token::Cswap,
+        b"MCX" => Token::Mcx,
+        b"RESET" => Token::Reset,
+        b"MEASURE_X" => Token::MeasureX,
+        b"MEASURE_Y" => Token::MeasureY,
+        b"SET" => Token::Set,
+        b"NOT" => Token::Not,
+        b"AND" => Token::And,
+        b"OR" => Token::Or,
+        b"XOR" => Token::Xor,
+        b"ADD" => Token::Add,
+        b"SUB" => Token::Sub,
+        // v0.2 observables
+        b"EXPECT" => Token::Expect,
+        b"ESTIMATE" => Token::Estimate,
+        b"SAVE_STATEVECTOR" => Token::SaveState,
+        b"SAVE_AMPLITUDES" => Token::SaveAmps,
+        b"SAVE_PROBABILITIES" => Token::SaveProbs,
+        // subroutines
+        b"GATE" => Token::Gate,
+        b"ENDGATE" => Token::Endgate,
         _ => Token::Error,
     }
 }
@@ -272,9 +459,13 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_keyword_is_error() {
+    fn test_unknown_word_is_gate_name() {
+        // An unknown word is a user-defined gate name (call site), not a
+        // lexer error; the parser reports "undefined gate" if never defined.
         let mut lex = LexResult::new();
         tokenise(b"FOO 0\n", &mut lex);
-        assert!(lex.error);
+        assert!(!lex.error);
+        assert_eq!(lex.tokens[0], Token::Ident);
+        assert_eq!(lex.ident_at(0), b"FOO");
     }
 }

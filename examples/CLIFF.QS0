@@ -1,0 +1,32 @@
+// CLIFF.QS0 - a Clifford-only circuit for the stabilizer engine.
+//
+// Demonstrates: the stabilizer engine (--stabilizer), Clifford gates
+// (H, S, CNOT, CZ), and exact simulation.
+//
+// Qubit-level explanation:
+//   All gates here are Clifford gates: they conjugate Pauli operators to
+//   Pauli operators. Such circuits can be simulated exactly, and in
+//   polynomial time, by the stabilizer engine, which tracks the n-qubit
+//   stabilizer group instead of the 2^n amplitudes. Plasma selects the
+//   engine automatically with --stabilizer, and the results are identical
+//   to the statevector reference for the same seed.
+//
+//   The circuit builds a three-qubit GHZ state and adds relative phases:
+//     H 0; CNOT 0 1; CNOT 1 2   give (|000>+|111>)/sqrt2,
+//     S 2 adds a phase to the |1> component of qubit 2,
+//     CZ 1 2 negates the amplitude when qubits 1 and 2 are both |1>.
+//   The phases do not affect the probabilities, so the measured distribution
+//   is still the 50/50 |000>/|111> split.
+//
+// Run:
+//   plasma run examples/CLIFF.QS0 --stabilizer --shots 1000
+//   plasma run examples/CLIFF.QS0 --shots 1000              (reference)
+QUBITS 3
+H 0
+CNOT 0 1
+CNOT 1 2
+S 2
+CZ 1 2
+SHOT 1000
+PRINT
+END

@@ -1,8 +1,11 @@
 [package]
 name = "plasma"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-only"
+description = "A high-level quantum computing language and deterministic quantum circuit simulator"
+authors = ["Faris Alfarhan"]
+repository = "https://github.com/faris0x/Plasma"
 
 [[bin]]
 name = "plasma"

@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Faris Alfarhan
 // SPDX-License-Identifier: GPL-3.0-only
 
-/// LCG64 — 64-bit linear congruential generator (MMIX variant).
+/// LCG64, 64-bit linear congruential generator (MMIX variant).
 ///
 /// Period: 2^64. Statistical quality is sufficient for quantum
 /// measurement sampling where we only need ~10^4 samples per simulation.

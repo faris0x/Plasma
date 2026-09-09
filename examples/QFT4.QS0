@@ -1,0 +1,41 @@
+// QFT4.QS0 - the four-qubit quantum Fourier transform.
+//
+// Demonstrates: parametric rotations (RZ/RY/RX), the controlled-phase gate
+// (CPHASE), SWAP, and how a quantum algorithm encodes phase information.
+//
+// Qubit-level explanation:
+//   We start from |0001> (X 0 sets qubit 0). The QFT maps a computational
+//   basis state |k> to a uniform superposition whose relative phases encode
+//   k:
+//       |k>  ->  (1/sqrt(16)) * sum_j exp(2*pi*i*j*k/16) |j>.
+//   The phases do not affect the measurement probabilities, so the result is
+//   a roughly uniform distribution over all 16 basis states.
+//
+//   The circuit: for each qubit i, apply H i, then a controlled phase
+//   CPHASE(i, j, pi/2^(j-i)) between i and every later qubit j. The final
+//   SWAP ladder reverses the qubit order (standard QFT bit reversal), so the
+//   measured state is the transform in the natural ordering.
+//
+//   Each angle is written out as a decimal; Plasma stores it in its constant
+//   pool and applies the rotation via its deterministic CORDIC sin/cos.
+//
+// Run:
+//   plasma run examples/QFT4.QS0 --shots 2000
+//   plasma run examples/QFT4.QS0 --gpu --shots 2000
+QUBITS 4
+X 0
+H 0
+CPHASE 0 1 1.5707963267948966
+CPHASE 0 2 0.7853981633974483
+CPHASE 0 3 0.39269908169872414
+H 1
+CPHASE 1 2 1.5707963267948966
+CPHASE 1 3 0.7853981633974483
+H 2
+CPHASE 2 3 1.5707963267948966
+H 3
+SWAP 0 3
+SWAP 1 2
+SHOT 2000
+PRINT
+END

@@ -1,0 +1,46 @@
+// MEASXY.QS0 - measuring in the X and Y bases, plus mid-circuit reset.
+//
+// Demonstrates: MEASURE_X, MEASURE_Y, RESET, classical control (IF).
+//
+// Qubit-level explanation:
+//   H 0 creates the state |+> = (|0>+|1>)/sqrt2 on qubit 0. |+> is an
+//   eigenstate of X with eigenvalue +1, so measuring it in the X basis
+//   (MEASURE_X) is deterministic: the OUTCOME c0 is always 0. This is the
+//   X-basis analogue of measuring |0> in the Z basis.
+//
+//   S 1 then H 1 creates |+i> = (|0>+i|1>)/sqrt2 on qubit 1, the +1
+//   eigenstate of Y. Measuring in the Y basis (MEASURE_Y) is therefore also
+//   deterministic: the outcome c1 is always 0.
+//
+//   X 2 prepares |1> on qubit 2, then RESET 2 collapses it back to |0>.
+//   RESET is "measure, then correct if the outcome was 1"; no classical bit
+//   is written.
+//
+//   The IF block is dead code here because c0 is always 0, but it shows how
+//   a measurement outcome can drive later gates.
+//
+//   Key point: the post-measurement state of qubit 0 is still |+>, and that
+//   of qubit 1 is still |+i>. Both are superpositions in the Z basis, so a
+//   later Z-basis sample reports qubits 0 and 1 as random. The deterministic
+//   quantities are the X/Y measurement OUTCOMES (c0 and c1 are always 0),
+//   not the Z-basis histogram.
+//
+//   The histogram is therefore |000>, |001>, |010>, |011> at ~25% each,
+//   with qubit 2 always |0> after the reset.
+//
+// Run:
+//   plasma run examples/MEASXY.QS0 --shots 1000
+QUBITS 3
+H 0
+S 1
+H 1
+X 2
+RESET 2
+MEASURE_X 0 -> c0
+MEASURE_Y 1 -> c1
+IF c0 == 1 THEN
+  X 2
+ENDIF
+SHOT 1000
+PRINT
+END

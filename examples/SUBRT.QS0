@@ -1,0 +1,32 @@
+// SUBRT.QS0 - reusable subcircuits via GATE/ENDGATE and CALL.
+//
+// Demonstrates: the subroutine feature.
+//
+// Qubit-level explanation:
+//   A GATE block defines a named subcircuit whose body operates on formal
+//   parameters (qubits 0..nparams-1 inside the body). A call binds real
+//   qubits to those parameters, positionally. Bodies are stored once in a
+//   separate program region and reached by jump-based calls, so no code is
+//   duplicated.
+//
+//   Here "bell 2" creates a Bell pair on its two arguments. Calling it twice,
+//   on (0,1) and (2,3), builds two independent Bell pairs:
+//       (|00>+|11>)/sqrt2  tensor  (|00>+|11>)/sqrt2
+//     = (|0000>+|0011>+|1100>+|1111>)/2.
+//   The four outcomes are each measured with probability 1/4. Because the
+//   circuit is composed from one primitive, editing the GATE body updates
+//   every call site at once.
+//
+// Run:
+//   plasma run examples/SUBRT.QS0 --shots 1000
+//   plasma run examples/SUBRT.QS0 --gpu --shots 1000
+QUBITS 4
+GATE bell 2
+H 0
+CNOT 0 1
+ENDGATE
+bell 0 1
+bell 2 3
+SHOT 1000
+PRINT
+END

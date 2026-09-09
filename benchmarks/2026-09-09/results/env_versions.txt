@@ -1,0 +1,16 @@
+=== Plasma ===
+af8644f
+=== venv314 (Aer/cuQuantum) ===
+cupy-cuda13x==14.2.0
+cuquantum-python-cu13==26.6.0
+custatevec-cu13==1.14.0
+cutensor-cu13==2.7.0
+cutensornet-cu13==2.13.0
+numpy==2.5.2
+qiskit==2.5.2
+qiskit-aer @ file:///tmp/opencode/aer_src/qiskit_aer-0.17.2
+=== venv313 (qsim/qulacs) ===
+=== GPU ===
+NVIDIA GeForce RTX 5070, 610.57.04, 12227 MiB
+=== CUDA ===
+Build cuda_13.3.r13.3/compiler.38244171_0
