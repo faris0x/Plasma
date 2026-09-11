@@ -137,7 +137,7 @@ pub struct Program {
     pub subs: [Sub; MAX_SUBS],
     pub num_subs: usize,
     /// Weighted-Pauli term pool for `ESTIMATE` (coef, pauli-code).
-    pub estimate_terms: [(f64, u32); MAX_ESTIMATE_TERMS],
+    pub estimate_terms: [(f64, u64); MAX_ESTIMATE_TERMS],
     pub num_estimate_terms: usize,
     /// Total ops including sub-program bodies (`sub_len >= len`; the main
     /// executable region is `ops[0..len)`, sub bodies are `ops[len..sub_len)`).
@@ -184,7 +184,7 @@ impl Program {
     }
 
     /// Append a weighted-Pauli term to the ESTIMATE pool.
-    pub fn push_estimate_term(&mut self, coef: f64, pauli: u32) -> bool {
+    pub fn push_estimate_term(&mut self, coef: f64, pauli: u64) -> bool {
         if self.num_estimate_terms >= MAX_ESTIMATE_TERMS {
             return false;
         }

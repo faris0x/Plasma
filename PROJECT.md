@@ -4,7 +4,7 @@ Copyright (c) 2026 Faris Alfarhan
 
 Licensed GNU GPL version 3.
 
-Version 0.2.
+Version 0.2.1.
 
 This document specifies the project: architecture, engineering decisions, and
 determinism machinery. The language, including syntax, semantics, IR, and
@@ -136,8 +136,9 @@ Both are validated by unit tests and by the sin^2+cos^2 identity sweep.
 Measured: on a gate-dense same-pair circuit, 601 gates fuse to 2 fused ops and
 a ~325× CPU speedup (854 ms to 2.6 ms for 100k shots). On random 10-qubit
 circuits the op count barely drops (752 to 686) because there are no long
-same-pair runs; there the primary GPU benefit is kernel-launch elimination
-(686 launches to one persistent kernel), not fewer operations.
+same-pair runs. Note the fused stream is consumed only by the `--fuse` CPU
+executor; the GPU backend achieves kernel-launch elimination independently via
+its own mega-kernel op encoding (`build_mega_ops`), not via `FusedOp`.
 
 ## 6. GPU backend
 
@@ -228,13 +229,16 @@ so giving Aer the newer toolchain removes any handicap. The harness is honest:
 ## 8. Feature backends
 
 - **Stabilizer engine**: `src/stabilizer.rs` performs exact CH/tableau
-  simulation of Clifford circuits (H/S/X/CNOT/CZ/SWAP plus measure/expect and
-  control flow). The `--stabilizer` flag adaptively runs any Clifford-only
-  program on it (with a diagnostic when it falls back to the statevector); for
-  the same seed, EXPECT values are exact and shot histograms statistically
-  identical to the reference. The executor is backend-generic (`SimBackend`
-  trait). Validated on 60 randomized Clifford circuits plus focused
-  measurement tests.
+  simulation of Clifford circuits (H/S/X/CNOT/CZ/SWAP/ISWAP plus measure/
+  expect and control flow; `ISWAP = (S⊗S)×CZ×SWAP` is composed from the
+  existing tableau updates). The `--stabilizer` flag adaptively runs any
+  Clifford-only program on it (with a diagnostic when it falls back to the
+  statevector); for the same seed, EXPECT values are exact and shot
+  histograms statistically identical to the reference. The executor is
+  backend-generic (`SimBackend` trait). Validated on 60 randomized Clifford
+  circuits (including ISWAP) plus focused measurement tests. Non-Clifford
+  gates (rotations, T, SX, Toffoli, MCX, CSWAP, CPHASE) fall back to the
+  statevector.
 - **Noise models**: sampled-Kraus depolarizing, amplitude damping (correct
   pure-state form), phase damping, and readout error (`--noise-*`);
   deterministic (seeded RNG, fixed draw order), forces the CPU reference.
@@ -245,7 +249,10 @@ so giving Aer the newer toolchain removes any handicap. The harness is honest:
 - **MPS engine**: `src/mps.rs` performs matrix-product-state simulation
   (`--mps D`) with truncated-SVD re-splitting (exact 2x2 Hermitian block
   diagonalization), SWAP-based qubit routing with permutation
-  tracking, and exact marginal sampling via bra-ket sandwich contraction.
+  tracking, and exact marginal sampling in O(n×D^3) total: a right
+  environment (contraction of all sites to the right) is built once per
+  sample and the collapse of previously-sampled sites is carried in a left
+  density matrix, so each site's marginal is a local sandwich contraction.
   Exact for low-entanglement circuits (validated: EXPECT bit-identical,
   histograms statistically identical on Bell/chain/measurement circuits);
   SVD truncation error is tracked and reported. Known limitation: the deep

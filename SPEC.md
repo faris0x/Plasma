@@ -4,7 +4,7 @@ Copyright (c) 2026 Faris Alfarhan
 
 Licensed GNU GPL version 3.
 
-Version 0.2. Draft; the language is subject to change. This specification
+Version 0.2.1. Draft; the language is subject to change. This specification
 describes the current language. Plasma is a superset of its v0.1 form, and
 the backward-compatibility rule (§9) is normative: everything specified here
 is guaranteed to keep its meaning in every later version.

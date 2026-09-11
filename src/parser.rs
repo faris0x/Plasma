@@ -655,7 +655,7 @@ fn parse_line(
                         fail!(diag, lex, pos, "Pauli qubit index out of range");
                     }
                 }
-                if !prog.push_estimate_term(coef, code as u32) {
+                if !prog.push_estimate_term(coef, code) {
                     fail!(diag, lex, pos, "too many ESTIMATE terms");
                 }
                 n += 1;

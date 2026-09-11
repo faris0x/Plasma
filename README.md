@@ -4,7 +4,7 @@ Copyright (c) 2026 Faris Alfarhan
 
 Licensed GNU GPL version 3.
 
-Version 0.2.
+Version 0.2.1.
 
 ## What is Plasma?
 
@@ -78,9 +78,10 @@ Worked programs live in `examples/`, each with a step-by-step explanation:
 - CPU: deterministic reference interpreter (`src/sim.rs`), plus a fused
   execution path (`--fuse`) over the gate-fusion pass (`src/fusion.rs`).
 - Stabilizer engine (`--stabilizer`): exact CH/tableau simulation of
-  Clifford-only circuits (`src/stabilizer.rs`).
+  Clifford-only circuits (H/S/X/CNOT/CZ/SWAP/ISWAP) (`src/stabilizer.rs`).
 - MPS engine (`--mps D`): matrix-product-state simulation with truncated-SVD
-  re-splitting for low-entanglement circuits (`src/mps.rs`).
+  re-splitting and O(n×D^3) marginal sampling for low-entanglement circuits
+  (`src/mps.rs`).
 - Noise models (`--noise-*`): sampled-Kraus depolarizing / amplitude damping /
   phase damping / readout error, deterministic per seed; readout error
   mitigation via `--mitigate-readout`.

@@ -11,9 +11,11 @@
 //! fused (measurements, multi-qubit gates, classical computation) pass
 //! through unchanged as `FusedOp::Original`.
 //!
-//! The fused stream is the input to the GPU persistent-kernel executor
-//! (kernel-launch elimination) and is a strictly-shrinking transform:
-//! it never increases the op count.
+//! The fused stream feeds the `--fuse` CPU executor (`sim.rs`) and is a
+//! strictly-shrinking transform: it never increases the op count. The GPU
+//! backend does not consume `FusedOp`; it packs `IrOp`s into its own
+//! shared-memory mega-kernel encoding (`gpu/mod.rs`, `build_mega_ops`), so
+//! GPU kernel-launch elimination is independent of this pass.
 //!
 //! Floating point: fusing changes the evaluation order, so fused results
 //! agree with the unfused reference within float tolerance, not bit-for-bit.

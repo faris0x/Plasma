@@ -339,9 +339,6 @@ impl StabilizerBackend {
     }
 }
 impl super::sim::SimBackend for StabilizerBackend {
-    fn reset_backend(num_qubits: u8, _noise: super::sim::NoiseModel) -> Self {
-        StabilizerBackend::new(num_qubits)
-    }
     fn reset(&mut self) {
         StabilizerBackend::reset(self);
     }
@@ -381,8 +378,12 @@ impl super::sim::SimBackend for StabilizerBackend {
     fn apply_swap(&mut self, a: u8, b: u8) {
         StabilizerBackend::apply_swap(self, a, b);
     }
-    fn apply_iswap(&mut self, _a: u8, _b: u8) {
-        panic!("non-Clifford gate on the stabilizer engine");
+    fn apply_iswap(&mut self, a: u8, b: u8) {
+        // ISWAP = (S_a ⊗ S_b) × CZ × SWAP, all Clifford; applied rightmost-first.
+        StabilizerBackend::apply_swap(self, a, b);
+        StabilizerBackend::apply_cz(self, a, b);
+        StabilizerBackend::apply_s(self, a);
+        StabilizerBackend::apply_s(self, b);
     }
     fn apply_cz(&mut self, a: u8, b: u8) {
         StabilizerBackend::apply_cz(self, a, b);

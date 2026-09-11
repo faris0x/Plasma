@@ -1107,7 +1107,7 @@ impl Gpu {
                     let mut h = 0.0;
                     for k in off as usize..(off as usize + len as usize) {
                         let (c, p) = prog.estimate_terms[k];
-                        h += c * self.expect_value(p as u64)?;
+                        h += c * self.expect_value(p)?;
                     }
                     results.estimates.push(h);
                 }

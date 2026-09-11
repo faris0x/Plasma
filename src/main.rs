@@ -474,8 +474,8 @@ fn print_json(prog: &Program, histogram: &[u32], results: &sim::Results, seed: u
     let mut out = String::new();
     out.push_str("{\n");
     out.push_str(&format!(
-        "  \"plasma\": {{\"version\": \"0.2\", \"qubits\": {}, \"shots\": {}, \"seed\": {}}},\n",
-        prog.num_qubits, total, seed
+        "  \"plasma\": {{\"version\": \"{}\", \"qubits\": {}, \"shots\": {}, \"seed\": {}}},\n",
+        env!("CARGO_PKG_VERSION"), prog.num_qubits, total, seed
     ));
     // Histogram: map of basis-string -> count.
     out.push_str("  \"histogram\": {");

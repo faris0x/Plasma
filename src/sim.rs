@@ -214,9 +214,8 @@ impl NoiseModel {
 }
 
 /// Backend interface used by the generic executor: implemented by the
-/// statevector `CpuBackend` and the stabilizer (Clifford) engine.
+/// statevector `CpuBackend` and the stabilizer (Clifford) and MPS engines.
 pub trait SimBackend {
-    fn reset_backend(num_qubits: u8, noise: NoiseModel) -> Self;
     fn reset(&mut self);
     fn apply_h(&mut self, q: u8);
     fn apply_x(&mut self, q: u8);
@@ -1073,9 +1072,6 @@ fn run_stabilizer_generic(
 /// suffices.) Programs with calls are not fused, the fused stream cannot
 /// host sub bodies, so the regular executor handles them.
 impl SimBackend for CpuBackend {
-fn reset_backend(num_qubits: u8, noise: NoiseModel) -> Self {
-    CpuBackend::with_noise(num_qubits, noise)
-}
 fn reset(&mut self) { self.reset(); }
 fn apply_h(&mut self, q: u8) { self.apply_h(q); }
 fn apply_x(&mut self, q: u8) { self.apply_x(q); }
@@ -1120,7 +1116,7 @@ pub fn is_clifford_program(prog: &Program) -> bool {
         match prog.ops[i] {
             IrOp::RZ(..) | IrOp::RX(..) | IrOp::RY(..) | IrOp::Phase(..) | IrOp::T(..)
             | IrOp::SX(..) | IrOp::Toff(..) | IrOp::MCX(..) | IrOp::CPHASE(..)
-            | IrOp::ISWAP(..) | IrOp::CSWAP(..) | IrOp::SaveState | IrOp::SaveAmps
+            | IrOp::CSWAP(..) | IrOp::SaveState | IrOp::SaveAmps
             | IrOp::SaveProbs => return false,
             _ => {}
         }
@@ -1223,7 +1219,7 @@ fn exec_fused_ops(
                     let mut h = 0.0;
                     for k in off as usize..(off as usize + len as usize) {
                         let (c, p) = prog.estimate_terms[k];
-                        h += c * backend.expect_value(p as u64);
+                        h += c * backend.expect_value(p);
                     }
                     results.estimates.push(h);
                 }
@@ -1399,7 +1395,7 @@ fn exec_ops<B: SimBackend>(
                 let mut h = 0.0;
                 for k in off as usize..(off as usize + len as usize) {
                     let (c, p) = prog.estimate_terms[k];
-                    h += c * backend.expect_value(p as u64);
+                    h += c * backend.expect_value(p);
                 }
                 results.estimates.push(h);
             }
@@ -1687,7 +1683,6 @@ mod tests {
 
     const PI: f64 = 3.141592653589793;
     const HALF_PI: f64 = 1.5707963267948966;
-    const PI_4: f64 = 0.7853981633974483;
 
     fn re(sim: &CpuBackend, i: usize) -> f64 {
         sim.state.re[i]
@@ -2216,6 +2211,26 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_high_qubit_pauli() {
+        // Regression: ESTIMATE terms on qubits >= 16 lost their 2-bit Pauli
+        // field when the term pool stored the code as u32 (the field sits at
+        // bit >= 32), silently evaluating to the identity.
+        let prog = parse_test(b"QUBITS 17\nH 0\nCNOT 0 16\nEXPECT Z16\nESTIMATE 1.0 Z16\nPRINT\n");
+        let mut results = Results::default();
+        let mut classical = [0u8; 64];
+        let mut hist = vec![0u32; 1 << 17];
+        let mut rng = Lcg64::new(1);
+        run_program(&prog, &mut results, &mut classical, &mut hist, &mut rng, NoiseModel::default());
+        assert_eq!(results.expectations.len(), 1);
+        assert_eq!(results.estimates.len(), 1);
+        let e = results.expectations[0];
+        let est = results.estimates[0];
+        assert!((est - e).abs() < 1e-9, "ESTIMATE {est} != EXPECT {e}");
+        // Bell pair on (0, 16): <Z16> = 0 (the bug made ESTIMATE return 1.0).
+        assert!(e.abs() < 1e-9, "Z16 on a Bell pair should be ~0, got {e}");
+    }
+
+    #[test]
     fn test_mitigate_readout() {
         // c_true = M^-1 c_obs for a single qubit: perfect |0> measurements
         // contaminated by readout rate p; inversion recovers the ideal.
@@ -2250,7 +2265,7 @@ mod tests {
             let mut src = format!("QUBITS {n}\n");
             let gates = 6 + rand(14);
             for _ in 0..gates {
-                match rand(6) {
+                match rand(7) {
                     0 => src.push_str(&format!("H {}\n", rand(n as u64))),
                     1 => src.push_str(&format!("S {}\n", rand(n as u64))),
                     2 => src.push_str(&format!("X {}\n", rand(n as u64))),
@@ -2270,13 +2285,21 @@ mod tests {
                         }
                         src.push_str(&format!("SWAP {a} {b}\n"));
                     }
-                    _ => {
+                    5 => {
                         let a = rand(n as u64);
                         let mut b = rand(n as u64);
                         while b == a {
                             b = rand(n as u64);
                         }
                         src.push_str(&format!("CZ {a} {b}\n"));
+                    }
+                    _ => {
+                        let a = rand(n as u64);
+                        let mut b = rand(n as u64);
+                        while b == a {
+                            b = rand(n as u64);
+                        }
+                        src.push_str(&format!("ISWAP {a} {b}\n"));
                     }
                 }
             }
@@ -2331,14 +2354,18 @@ mod tests {
 
     #[test]
     fn test_clifford_detection() {
-        let ok = parse_test(b"QUBITS 2\nH 0\nCNOT 0 1\nS 1\nSWAP 0 1\nEXPECT Z0Z1\nPRINT\n");
-        assert!(is_clifford_program(&ok));
-        let bad = parse_test(b"QUBITS 2\nH 0\nRY 0 1.3\nPRINT\n");
-        assert!(!is_clifford_program(&bad));
-        let toff = parse_test(b"QUBITS 3\nH 0\nTOFF 0 1 2\nPRINT\n");
-        assert!(!is_clifford_program(&toff));
-        let save = parse_test(b"QUBITS 2\nH 0\nSAVE_STATEVECTOR\nPRINT\n");
-        assert!(!is_clifford_program(&save));
+        // Each Program is a ~268 KB fixed-capacity struct; build and drop one
+        // at a time to keep the test-thread stack well under its limit.
+        let is_clifford = |src: &[u8]| {
+            let prog = parse_test(src);
+            is_clifford_program(&prog)
+        };
+        assert!(is_clifford(b"QUBITS 2\nH 0\nCNOT 0 1\nS 1\nSWAP 0 1\nEXPECT Z0Z1\nPRINT\n"));
+        assert!(is_clifford(b"QUBITS 2\nH 0\nCNOT 0 1\nISWAP 0 1\nPRINT\n"),
+                "ISWAP is Clifford and must be detected");
+        assert!(!is_clifford(b"QUBITS 2\nH 0\nRY 0 1.3\nPRINT\n"));
+        assert!(!is_clifford(b"QUBITS 3\nH 0\nTOFF 0 1 2\nPRINT\n"));
+        assert!(!is_clifford(b"QUBITS 2\nH 0\nSAVE_STATEVECTOR\nPRINT\n"));
     }
 
 

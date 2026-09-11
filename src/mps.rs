@@ -3,18 +3,13 @@
 
 //! Matrix-product-state (MPS) simulation engine.
 //!
-//! A left-canonical MPS represents the state as a chain of complex tensors
-//! `A[k]` of shape `[D_k, 2, D_{k+1}]` (left bond, physical, right bond),
-//! with `D_0 = D_n = 1`:
+//! An MPS represents the state as a chain of complex tensors `A[k]` of shape
+//! `[D_k, 2, D_{k+1}]` (left bond, physical, right bond), with
+//! `D_0 = D_n = 1`:
 //!
 //! ```text
 //! |ψ> = sum_{i} A[0][i0] A[1][i1] ... A[n-1][i_{n-1}] |i0 ... i_{n-1}>
 //! ```
-//!
-//! Left-canonical means every `A[k]` is left-orthonormal (the virtual index
-//! contraction yields the identity). This makes sampling exact and cheap:
-//! the marginal of the first physical qubit is read off `A[0]`, and
-//! conditioning on an outcome leaves a valid left-canonical MPS.
 //!
 //! Gates: single-qubit gates are a local tensor contraction; two-qubit gates
 //! on adjacent sites are applied by contracting the pair, applying the gate,
@@ -24,6 +19,13 @@
 //! squared-norm error is tracked and reported (`--mps D`), so the engine is
 //! exact when the entanglement stays within the bond dimension and
 //! approximate (with a reported error) when it does not.
+//!
+//! Sampling: the per-site marginal is computed by contracting the site with
+//! a right environment (all sites to the right, built once per sample in
+//! O(n × D^3)) and a left density matrix that accumulates the collapse of all
+//! sites sampled so far. Total cost is O(n × D^3), exact for any MPS (no
+//! canonical-form assumption), and consumes the seeded host RNG in a fixed
+//! site order.
 //!
 //! Determinism: all sampling uses the seeded host RNG in a fixed order.
 
@@ -259,18 +261,87 @@ impl MpsBackend {
         self.dims[k + 1] = d;
     }
 
-    /// Sampling: exact marginal sampling via bra-ket sandwich contraction and
-    /// sequential collapse (works for any MPS, no canonical-form assumption).
+    /// Sampling: exact marginal sampling in O(n × D^3) total. A right
+    /// environment is built once (contraction of all sites to the right of
+    /// each site) and the collapse of previously-sampled sites is carried in
+    /// a left density matrix. Works for any MPS (no canonical-form
+    /// assumption) and consumes the host RNG once per site in site order,
+    /// matching the RNG semantics of the sandwich path.
     pub fn sample_outcome(&mut self, rng: &mut super::rng::Lcg64) -> usize {
+        let env = self.right_envs();
         let mut out = 0usize;
+        let mut left: Vec<C> = vec![C::one()]; // dims[0] = 1
         for k in 0..self.n {
-            let pr = self.site_marginals(k);
+            let d_l = self.dims[k];
+            let d_r = self.dims[k + 1];
+            let mut pr = [0.0f64; 2];
+            for outcome in 0..2 {
+                // P = tr(left . A_k[outcome] . R_k . A_k[outcome]^dag) via
+                // M = B^dag . left . B, P = sum Re(M . conj(R)).
+                let b = self.slice_b(k, d_l, d_r, outcome);
+                let m = left_b_dag(&left, &b, d_l, d_r);
+                let mut p = 0.0;
+                for r in 0..d_r {
+                    for rp in 0..d_r {
+                        let e = env[k][r * d_r + rp];
+                        let mv = m[r * d_r + rp];
+                        p += mv.re * e.re + mv.im * e.im;
+                    }
+                }
+                pr[outcome] = p;
+            }
             let total = pr[0] + pr[1];
             let outcome: usize = if total > 0.0 && rng.next_f64() * total < pr[0] { 0 } else { 1 };
-            self.collapse_position(k, outcome);
+            // Fold the collapsed site into the left density matrix.
+            let b = self.slice_b(k, d_l, d_r, outcome);
+            left = left_b_dag(&left, &b, d_l, d_r);
             out |= outcome << self.perm[k];
         }
         out
+    }
+
+    /// The matrix `B[a, r] = A[k][(a, outcome), r]` (a `d_l × d_r` slice).
+    fn slice_b(&self, k: usize, d_l: usize, d_r: usize, outcome: usize) -> Vec<C> {
+        let mut b = vec![C::zero(); d_l * d_r];
+        for a in 0..d_l {
+            for r in 0..d_r {
+                b[a * d_r + r] = self.a[k][(a * 2 + outcome) * d_r + r];
+            }
+        }
+        b
+    }
+
+    /// Right environments `R[k]`: the `[dims[k+1] × dims[k+1]]` contraction
+    /// of all sites to the right of `k` (with their mutual bonds). `R[n-1]`
+    /// is the identity on the trivial last bond. Built once, O(n × D^3).
+    fn right_envs(&self) -> Vec<Vec<C>> {
+        let mut env: Vec<Vec<C>> = Vec::with_capacity(self.n);
+        for _ in 0..self.n {
+            env.push(Vec::new());
+        }
+        env[self.n - 1] = vec![C::one()];
+        for k in (0..self.n - 1).rev() {
+            let s = k + 1;
+            let d_l = self.dims[s];
+            let d_r = self.dims[s + 1];
+            let mut acc = vec![C::zero(); d_l * d_l];
+            for i in 0..2 {
+                // B[a, c] = A[s][(a, i), c]; acc += B . R[k+1] . B^dag.
+                let b = self.slice_b(s, d_l, d_r, i);
+                let tmp = mmul(&b, d_l, d_r, &env[k + 1], d_r);
+                for a in 0..d_l {
+                    for ap in 0..d_l {
+                        let mut v = C::zero();
+                        for c in 0..d_r {
+                            v = v.add(&tmp[a * d_r + c].mul(&b[ap * d_r + c].conj()));
+                        }
+                        acc[a * d_l + ap] = acc[a * d_l + ap].add(&v);
+                    }
+                }
+            }
+            env[k] = acc;
+        }
+        env
     }
 
     /// Measure one physical qubit: route it to the front, sample/collapse it.
@@ -390,6 +461,42 @@ impl MpsBackend {
     pub fn norm(&self) -> f64 {
         self.expect_value(0)
     }
+}
+
+/// Complex matrix multiply: `a` is `ma × na`, `b` is `na × nb`; result
+/// `ma × nb` flattened row-major.
+fn mmul(a: &[C], ma: usize, na: usize, b: &[C], nb: usize) -> Vec<C> {
+    let mut out = vec![C::zero(); ma * nb];
+    for i in 0..ma {
+        for k in 0..na {
+            let av = a[i * na + k];
+            if av.re == 0.0 && av.im == 0.0 {
+                continue;
+            }
+            for j in 0..nb {
+                out[i * nb + j] = out[i * nb + j].add(&av.mul(&b[k * nb + j]));
+            }
+        }
+    }
+    out
+}
+
+/// `B^dag · left · B` for `left` (d_l × d_l) and `B` (d_l × d_r), returning
+/// a `d_r × d_r` matrix. Used to fold a collapsed site into the left density
+/// matrix and to form the marginal sandwich.
+fn left_b_dag(left: &[C], b: &[C], d_l: usize, d_r: usize) -> Vec<C> {
+    let tmp = mmul(left, d_l, d_l, b, d_r);
+    let mut out = vec![C::zero(); d_r * d_r];
+    for r in 0..d_r {
+        for rp in 0..d_r {
+            let mut v = C::zero();
+            for a in 0..d_l {
+                v = v.add(&b[a * d_r + r].conj().mul(&tmp[a * d_r + rp]));
+            }
+            out[r * d_r + rp] = v;
+        }
+    }
+    out
 }
 
 /// Truncated SVD of an m x n complex matrix `g` (flattened), keeping the
@@ -563,9 +670,6 @@ const SWAP4: [C; 16] = {
     ]
 };
 impl super::sim::SimBackend for MpsBackend {
-    fn reset_backend(num_qubits: u8, _noise: super::sim::NoiseModel) -> Self {
-        MpsBackend::new(num_qubits, 64)
-    }
     fn reset(&mut self) {
         self.reset();
     }
@@ -723,5 +827,80 @@ impl super::sim::SimBackend for MpsBackend {
     }
     fn save_probabilities(&mut self, _results: &mut super::sim::Results) {
         panic!("SAVE_* requires the statevector backend");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn h2() -> [C; 4] {
+        let s = 1.0 / crate::math::sqrt(2.0);
+        [C::new(s, 0.0), C::new(s, 0.0), C::new(s, 0.0), C::new(-s, 0.0)]
+    }
+
+    fn cnot4() -> [C; 16] {
+        let mut u = [C::zero(); 16];
+        u[0 * 4 + 0] = C::one(); // |00> -> |00>
+        u[1 * 4 + 1] = C::one(); // |01> -> |01>
+        u[3 * 4 + 2] = C::one(); // |10> -> |11>
+        u[2 * 4 + 3] = C::one(); // |11> -> |10>
+        u
+    }
+
+    fn build_4q(d: usize) -> MpsBackend {
+        let mut m = MpsBackend::new(4, d);
+        m.apply_single_u(0, &h2());
+        m.apply_two_u(0, 1, &cnot4());
+        m.apply_two_u(1, 2, &cnot4());
+        m.apply_single_u(3, &h2());
+        m.apply_two_u(2, 3, &cnot4());
+        m
+    }
+
+    #[test]
+    fn test_walk_marginals_match_sandwich() {
+        // The left-walk marginals (right environment + folded left density
+        // matrix) must match the bra-ket sandwich marginals of the reference
+        // MPS collapsed step-by-step in the same order.
+        for d in [1usize, 2, 4, 8] {
+            let walk = build_4q(d);
+            let mut reference = build_4q(d);
+            let env = walk.right_envs();
+            let mut left: Vec<C> = vec![C::one()];
+            for k in 0..walk.n {
+                let d_l = walk.dims[k];
+                let d_r = walk.dims[k + 1];
+                let mut pr = [0.0f64; 2];
+                for outcome in 0..2 {
+                    let b = walk.slice_b(k, d_l, d_r, outcome);
+                    let mm = left_b_dag(&left, &b, d_l, d_r);
+                    let mut p = 0.0;
+                    for r in 0..d_r {
+                        for rp in 0..d_r {
+                            let e = env[k][r * d_r + rp];
+                            let mv = mm[r * d_r + rp];
+                            p += mv.re * e.re + mv.im * e.im;
+                        }
+                    }
+                    pr[outcome] = p;
+                }
+                let sw = reference.site_marginals(k);
+                for outcome in 0..2 {
+                    let tol = 1e-9;
+                    assert!(
+                        (pr[outcome] - sw[outcome]).abs() < tol,
+                        "d={d} site {k}: walk {} vs sandwich {}",
+                        pr[outcome],
+                        sw[outcome]
+                    );
+                }
+                // Fold outcome 0 into the walk's left matrix and the reference
+                // tensors identically.
+                let b = walk.slice_b(k, d_l, d_r, 0);
+                left = left_b_dag(&left, &b, d_l, d_r);
+                reference.collapse_position(k, 0);
+            }
+        }
     }
 }
