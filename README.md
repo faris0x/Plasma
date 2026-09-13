@@ -1,5 +1,7 @@
 # Plasma
 
+<img width="874" height="560" alt="demo" src="https://github.com/faris0x/Plasma/blob/0d6644b7cd5faf0a0a5171339c20858d734c5ec7/demo.gif" />
+
 Copyright (c) 2026 Faris Alfarhan
 
 Licensed GNU GPL version 3.
