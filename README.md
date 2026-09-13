@@ -1,7 +1,5 @@
 # Plasma
 
-<img width="874" height="560" alt="demo" src="https://github.com/faris0x/Plasma/blob/0d6644b7cd5faf0a0a5171339c20858d734c5ec7/demo.gif" />
-
 Copyright (c) 2026 Faris Alfarhan
 
 Licensed GNU GPL version 3.
@@ -16,6 +14,8 @@ x86_64 operating system whose application is a quantum-computing workstation.
 The latest Plasma is shipped with each planckOS release. The name is a
 portmanteau of Planck and ASM (its syntax is line-based and assembly-like).
 Source files use the `.qs0` extension (FAT32 8.3 short filenames).
+
+<img width="874" height="560" alt="demo" src="https://github.com/faris0x/Plasma/blob/0d6644b7cd5faf0a0a5171339c20858d734c5ec7/demo.gif" />
 
 Two documents describe Plasma:
 
