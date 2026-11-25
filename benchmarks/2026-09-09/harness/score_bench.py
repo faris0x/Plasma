@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Faris Alfarhan
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Compute raw + weighted benchmark scores (Plasma baseline = 1.00)."""
 import argparse, csv, math, os
 

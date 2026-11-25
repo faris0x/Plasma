@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 fn main() {
-    // Link the CUDA driver API (libcuda). The driver's PTX JIT
-    // (libnvidia-ptxjitcompiler) is used at runtime; no nvcc/NVRTC is needed.
-    println!("cargo:rustc-link-lib=cuda");
+    // The CUDA driver is loaded at runtime, so no libcuda link is required.
     println!("cargo:rerun-if-changed=src/gpu/kernels.ptx");
     println!("cargo:rerun-if-changed=.git/HEAD");
 

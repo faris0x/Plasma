@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Faris Alfarhan
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Cross-platform quantum simulator benchmark, Plasma baseline.
 
 Measures kernel-level construction + sampling time for equivalent circuits

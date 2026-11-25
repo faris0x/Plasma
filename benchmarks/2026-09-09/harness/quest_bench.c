@@ -1,3 +1,6 @@
+/* Copyright (c) 2026 Faris Alfarhan */
+/* SPDX-License-Identifier: GPL-3.0-only */
+
 /* QuEST (v3.x) benchmark driver for the cross-platform suite.
  * Reads a gate file (opcode args per line) and reports:
  *   construct_ms  construction (gate application) time

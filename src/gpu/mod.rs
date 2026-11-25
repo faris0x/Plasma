@@ -12,14 +12,13 @@ use std::time::Instant;
 use plasma::ir::{IrOp, Program};
 use plasma::rng::Lcg64;
 
-// CUDA driver API bindings (raw FFI, no dependencies)
+// CUDA driver API bindings, loaded at runtime so CPU-only runs do not need
+// libcuda installed.
 
-// Hand-declared CUDA driver surface; entries are added ahead of use by
-// later pipeline work (async/pinned copies, streams).
-#[allow(dead_code)]
+#[allow(dead_code, non_snake_case)]
 mod ffi {
-    use std::ffi::c_char;
-    use std::ffi::c_void;
+    use std::ffi::{CStr, CString, c_char, c_void};
+    use std::sync::OnceLock;
 
     #[repr(C)]
     pub struct Ctx {
@@ -28,70 +27,319 @@ mod ffi {
 
     pub const CUDA_SUCCESS: i32 = 0;
 
+    type CuInit = unsafe extern "C" fn(u32) -> i32;
+    type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
+    type CuCtxCreate = unsafe extern "C" fn(*mut *mut Ctx, u32, i32) -> i32;
+    type CuCtxDestroy = unsafe extern "C" fn(*mut Ctx) -> i32;
+    type CuModuleLoadData = unsafe extern "C" fn(*mut *mut (), *const u8) -> i32;
+    type CuModuleUnload = unsafe extern "C" fn(*mut ()) -> i32;
+    type CuModuleGetFunction =
+        unsafe extern "C" fn(*mut *mut (), *mut (), *const c_char) -> i32;
+    type CuMemAlloc = unsafe extern "C" fn(*mut u64, u64) -> i32;
+    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, u64) -> i32;
+    type CuMemHostAlloc = unsafe extern "C" fn(*mut *mut c_void, u64, u32) -> i32;
+    type CuMemFreeHost = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuMemcpyDtoHAsync = unsafe extern "C" fn(*mut c_void, u64, u64, *mut ()) -> i32;
+    type CuStreamSynchronize = unsafe extern "C" fn(*mut ()) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, u64) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, u64) -> i32;
+    type CuEventCreate = unsafe extern "C" fn(*mut *mut (), u32) -> i32;
+    type CuEventRecord = unsafe extern "C" fn(*mut (), *mut ()) -> i32;
+    type CuEventSynchronize = unsafe extern "C" fn(*mut ()) -> i32;
+    type CuEventElapsedTime = unsafe extern "C" fn(*mut f32, *mut (), *mut ()) -> i32;
+    type CuEventDestroy = unsafe extern "C" fn(*mut ()) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut (),
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut (),
+        *const *const c_void,
+        *const *const c_void,
+    ) -> i32;
+    type CuLaunchCooperativeKernel = unsafe extern "C" fn(
+        *mut (),
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut (),
+        *const *const c_void,
+    ) -> i32;
+    type CuOccupancy = unsafe extern "C" fn(*mut i32, *mut (), i32, usize) -> i32;
+    type CuFuncSetAttribute = unsafe extern "C" fn(*mut (), i32, i32) -> i32;
+
+    struct CudaApi {
+        _handle: *mut c_void,
+        cuInit: CuInit,
+        cuDeviceGet: CuDeviceGet,
+        cuCtxCreate: CuCtxCreate,
+        cuCtxDestroy: CuCtxDestroy,
+        cuModuleLoadData: CuModuleLoadData,
+        cuModuleUnload: CuModuleUnload,
+        cuModuleGetFunction: CuModuleGetFunction,
+        cuMemAlloc: CuMemAlloc,
+        cuMemFree: CuMemFree,
+        cuMemsetD8: CuMemsetD8,
+        cuMemHostAlloc: CuMemHostAlloc,
+        cuMemFreeHost: CuMemFreeHost,
+        cuMemcpyDtoHAsync: CuMemcpyDtoHAsync,
+        cuStreamSynchronize: CuStreamSynchronize,
+        cuMemcpyHtoD: CuMemcpyHtoD,
+        cuMemcpyDtoH: CuMemcpyDtoH,
+        cuEventCreate: CuEventCreate,
+        cuEventRecord: CuEventRecord,
+        cuEventSynchronize: CuEventSynchronize,
+        cuEventElapsedTime: CuEventElapsedTime,
+        cuEventDestroy: CuEventDestroy,
+        cuLaunchKernel: CuLaunchKernel,
+        cuLaunchCooperativeKernel: CuLaunchCooperativeKernel,
+        cuOccupancyMaxActiveBlocksPerMultiprocessor: CuOccupancy,
+        cuFuncSetAttribute: CuFuncSetAttribute,
+    }
+
+    unsafe impl Send for CudaApi {}
+    unsafe impl Sync for CudaApi {}
+
+    static API: OnceLock<CudaApi> = OnceLock::new();
+
     extern "C" {
-        pub fn cuInit(flags: u32) -> i32;
-        pub fn cuDeviceGet(dev: *mut i32, ordinal: i32) -> i32;
-        pub fn cuCtxCreate(ctx: *mut *mut Ctx, flags: u32, dev: i32) -> i32;
-        pub fn cuCtxDestroy(ctx: *mut Ctx) -> i32;
-        pub fn cuModuleLoadData(module: *mut *mut (), image: *const u8) -> i32;
-        pub fn cuModuleUnload(module: *mut ()) -> i32;
-        pub fn cuModuleGetFunction(
-            func: *mut *mut (),
-            module: *mut (),
-            name: *const c_char,
-        ) -> i32;
-        pub fn cuMemAlloc(ptr: *mut u64, size: u64) -> i32;
-        pub fn cuMemFree(ptr: u64) -> i32;
-        pub fn cuMemsetD8(ptr: u64, value: u8, count: u64) -> i32;
-        pub fn cuMemHostAlloc(ptr: *mut *mut c_void, size: u64, flags: u32) -> i32;
-        pub fn cuMemFreeHost(ptr: *mut c_void) -> i32;
-        pub fn cuMemcpyDtoHAsync(
-            dst: *mut c_void,
-            src: u64,
-            count: u64,
-            stream: *mut (),
-        ) -> i32;
-        pub fn cuStreamSynchronize(stream: *mut ()) -> i32;
-        pub fn cuMemcpyHtoD(dst: u64, src: *const c_void, count: u64) -> i32;
-        pub fn cuMemcpyDtoH(dst: *mut c_void, src: u64, count: u64) -> i32;
-        pub fn cuEventCreate(event: *mut *mut (), flags: u32) -> i32;
-        pub fn cuEventRecord(event: *mut (), stream: *mut ()) -> i32;
-        pub fn cuEventSynchronize(event: *mut ()) -> i32;
-        pub fn cuEventElapsedTime(ms: *mut f32, start: *mut (), end: *mut ()) -> i32;
-        pub fn cuEventDestroy(event: *mut ()) -> i32;
-        #[allow(clippy::too_many_arguments)]
-        pub fn cuLaunchKernel(
-            func: *mut (),
-            grid_x: u32,
-            grid_y: u32,
-            grid_z: u32,
-            block_x: u32,
-            block_y: u32,
-            block_z: u32,
-            shared: u32,
-            stream: *mut (),
-            kernel_params: *const *const c_void,
-            extra: *const *const c_void,
-        ) -> i32;
-        pub fn cuLaunchCooperativeKernel(
-            func: *mut (),
-            grid_x: u32,
-            grid_y: u32,
-            grid_z: u32,
-            block_x: u32,
-            block_y: u32,
-            block_z: u32,
-            shared: u32,
-            stream: *mut (),
-            kernel_params: *const *const c_void,
-        ) -> i32;
-        pub fn cuOccupancyMaxActiveBlocksPerMultiprocessor(
-            num_blocks: *mut i32,
-            func: *mut (),
-            block_size: i32,
-            dynamic_shared: usize,
-        ) -> i32;
-        pub fn cuFuncSetAttribute(func: *mut (), attrib: i32, value: i32) -> i32;
+        fn dlopen(filename: *const c_char, flags: i32) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        fn dlerror() -> *const c_char;
+    }
+
+    const RTLD_NOW: i32 = 2;
+
+    fn dl_error() -> String {
+        let message = unsafe { dlerror() };
+        if message.is_null() {
+            "unknown error".to_string()
+        } else {
+            unsafe { CStr::from_ptr(message) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
+    fn symbol<T>(handle: *mut c_void, name: &str) -> Result<T, String> {
+        let symbol = CString::new(name).map_err(|_| format!("invalid symbol {name}"))?;
+        let pointer = unsafe { dlsym(handle, symbol.as_ptr()) };
+        if pointer.is_null() {
+            return Err(format!("CUDA driver is missing symbol {name}"));
+        }
+        Ok(unsafe { std::mem::transmute_copy(&pointer) })
+    }
+
+    impl CudaApi {
+        fn load() -> Result<Self, String> {
+            let library = CString::new("libcuda.so.1").unwrap();
+            let handle = unsafe { dlopen(library.as_ptr(), RTLD_NOW) };
+            if handle.is_null() {
+                return Err(format!("CUDA driver not found: {}", dl_error()));
+            }
+            Ok(CudaApi {
+                _handle: handle,
+                cuInit: symbol(handle, "cuInit")?,
+                cuDeviceGet: symbol(handle, "cuDeviceGet")?,
+                cuCtxCreate: symbol(handle, "cuCtxCreate")?,
+                cuCtxDestroy: symbol(handle, "cuCtxDestroy")?,
+                cuModuleLoadData: symbol(handle, "cuModuleLoadData")?,
+                cuModuleUnload: symbol(handle, "cuModuleUnload")?,
+                cuModuleGetFunction: symbol(handle, "cuModuleGetFunction")?,
+                cuMemAlloc: symbol(handle, "cuMemAlloc")?,
+                cuMemFree: symbol(handle, "cuMemFree")?,
+                cuMemsetD8: symbol(handle, "cuMemsetD8")?,
+                cuMemHostAlloc: symbol(handle, "cuMemHostAlloc")?,
+                cuMemFreeHost: symbol(handle, "cuMemFreeHost")?,
+                cuMemcpyDtoHAsync: symbol(handle, "cuMemcpyDtoHAsync")?,
+                cuStreamSynchronize: symbol(handle, "cuStreamSynchronize")?,
+                cuMemcpyHtoD: symbol(handle, "cuMemcpyHtoD")?,
+                cuMemcpyDtoH: symbol(handle, "cuMemcpyDtoH")?,
+                cuEventCreate: symbol(handle, "cuEventCreate")?,
+                cuEventRecord: symbol(handle, "cuEventRecord")?,
+                cuEventSynchronize: symbol(handle, "cuEventSynchronize")?,
+                cuEventElapsedTime: symbol(handle, "cuEventElapsedTime")?,
+                cuEventDestroy: symbol(handle, "cuEventDestroy")?,
+                cuLaunchKernel: symbol(handle, "cuLaunchKernel")?,
+                cuLaunchCooperativeKernel: symbol(handle, "cuLaunchCooperativeKernel")?,
+                cuOccupancyMaxActiveBlocksPerMultiprocessor: symbol(
+                    handle,
+                    "cuOccupancyMaxActiveBlocksPerMultiprocessor",
+                )?,
+                cuFuncSetAttribute: symbol(handle, "cuFuncSetAttribute")?,
+            })
+        }
+    }
+
+    /// Load the CUDA driver library and resolve its entry points.
+    pub fn load() -> Result<(), String> {
+        if API.get().is_some() {
+            return Ok(());
+        }
+        let api = CudaApi::load()?;
+        API.set(api)
+            .map_err(|_| "CUDA driver already initialised".to_string())
+    }
+
+    fn api() -> &'static CudaApi {
+        API.get().expect("CUDA API not loaded")
+    }
+
+    pub fn cuInit(flags: u32) -> i32 {
+        unsafe { (api().cuInit)(flags) }
+    }
+    pub fn cuDeviceGet(dev: *mut i32, ordinal: i32) -> i32 {
+        unsafe { (api().cuDeviceGet)(dev, ordinal) }
+    }
+    pub fn cuCtxCreate(ctx: *mut *mut Ctx, flags: u32, dev: i32) -> i32 {
+        unsafe { (api().cuCtxCreate)(ctx, flags, dev) }
+    }
+    pub fn cuCtxDestroy(ctx: *mut Ctx) -> i32 {
+        unsafe { (api().cuCtxDestroy)(ctx) }
+    }
+    pub fn cuModuleLoadData(module: *mut *mut (), image: *const u8) -> i32 {
+        unsafe { (api().cuModuleLoadData)(module, image) }
+    }
+    pub fn cuModuleUnload(module: *mut ()) -> i32 {
+        unsafe { (api().cuModuleUnload)(module) }
+    }
+    pub fn cuModuleGetFunction(
+        func: *mut *mut (),
+        module: *mut (),
+        name: *const c_char,
+    ) -> i32 {
+        unsafe { (api().cuModuleGetFunction)(func, module, name) }
+    }
+    pub fn cuMemAlloc(ptr: *mut u64, size: u64) -> i32 {
+        unsafe { (api().cuMemAlloc)(ptr, size) }
+    }
+    pub fn cuMemFree(ptr: u64) -> i32 {
+        unsafe { (api().cuMemFree)(ptr) }
+    }
+    pub fn cuMemsetD8(ptr: u64, value: u8, count: u64) -> i32 {
+        unsafe { (api().cuMemsetD8)(ptr, value, count) }
+    }
+    pub fn cuMemHostAlloc(ptr: *mut *mut c_void, size: u64, flags: u32) -> i32 {
+        unsafe { (api().cuMemHostAlloc)(ptr, size, flags) }
+    }
+    pub fn cuMemFreeHost(ptr: *mut c_void) -> i32 {
+        unsafe { (api().cuMemFreeHost)(ptr) }
+    }
+    pub fn cuMemcpyDtoHAsync(
+        dst: *mut c_void,
+        src: u64,
+        count: u64,
+        stream: *mut (),
+    ) -> i32 {
+        unsafe { (api().cuMemcpyDtoHAsync)(dst, src, count, stream) }
+    }
+    pub fn cuStreamSynchronize(stream: *mut ()) -> i32 {
+        unsafe { (api().cuStreamSynchronize)(stream) }
+    }
+    pub fn cuMemcpyHtoD(dst: u64, src: *const c_void, count: u64) -> i32 {
+        unsafe { (api().cuMemcpyHtoD)(dst, src, count) }
+    }
+    pub fn cuMemcpyDtoH(dst: *mut c_void, src: u64, count: u64) -> i32 {
+        unsafe { (api().cuMemcpyDtoH)(dst, src, count) }
+    }
+    pub fn cuEventCreate(event: *mut *mut (), flags: u32) -> i32 {
+        unsafe { (api().cuEventCreate)(event, flags) }
+    }
+    pub fn cuEventRecord(event: *mut (), stream: *mut ()) -> i32 {
+        unsafe { (api().cuEventRecord)(event, stream) }
+    }
+    pub fn cuEventSynchronize(event: *mut ()) -> i32 {
+        unsafe { (api().cuEventSynchronize)(event) }
+    }
+    pub fn cuEventElapsedTime(ms: *mut f32, start: *mut (), end: *mut ()) -> i32 {
+        unsafe { (api().cuEventElapsedTime)(ms, start, end) }
+    }
+    pub fn cuEventDestroy(event: *mut ()) -> i32 {
+        unsafe { (api().cuEventDestroy)(event) }
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn cuLaunchKernel(
+        func: *mut (),
+        grid_x: u32,
+        grid_y: u32,
+        grid_z: u32,
+        block_x: u32,
+        block_y: u32,
+        block_z: u32,
+        shared: u32,
+        stream: *mut (),
+        kernel_params: *const *const c_void,
+        extra: *const *const c_void,
+    ) -> i32 {
+        unsafe {
+            (api().cuLaunchKernel)(
+                func,
+                grid_x,
+                grid_y,
+                grid_z,
+                block_x,
+                block_y,
+                block_z,
+                shared,
+                stream,
+                kernel_params,
+                extra,
+            )
+        }
+    }
+    pub fn cuLaunchCooperativeKernel(
+        func: *mut (),
+        grid_x: u32,
+        grid_y: u32,
+        grid_z: u32,
+        block_x: u32,
+        block_y: u32,
+        block_z: u32,
+        shared: u32,
+        stream: *mut (),
+        kernel_params: *const *const c_void,
+    ) -> i32 {
+        unsafe {
+            (api().cuLaunchCooperativeKernel)(
+                func,
+                grid_x,
+                grid_y,
+                grid_z,
+                block_x,
+                block_y,
+                block_z,
+                shared,
+                stream,
+                kernel_params,
+            )
+        }
+    }
+    pub fn cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        num_blocks: *mut i32,
+        func: *mut (),
+        block_size: i32,
+        dynamic_shared: usize,
+    ) -> i32 {
+        unsafe {
+            (api().cuOccupancyMaxActiveBlocksPerMultiprocessor)(
+                num_blocks,
+                func,
+                block_size,
+                dynamic_shared,
+            )
+        }
+    }
+    pub fn cuFuncSetAttribute(func: *mut (), attrib: i32, value: i32) -> i32 {
+        unsafe { (api().cuFuncSetAttribute)(func, attrib, value) }
     }
 }
 
@@ -194,168 +442,168 @@ impl Gpu {
         let n = 1usize << num_qubits;
         let ptx: &[u8] = include_bytes!("kernels.ptx");
 
-        unsafe {
-            let t0 = Instant::now();
-            cu_check(ffi::cuInit(0), "cuInit")?;
-            let init_cuinit_us = t0.elapsed().as_micros();
+        ffi::load()?;
 
-            let t0 = Instant::now();
-            let mut dev: i32 = 0;
-            cu_check(ffi::cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
-            let mut ctx: *mut ffi::Ctx = std::ptr::null_mut();
-            cu_check(ffi::cuCtxCreate(&mut ctx, 0, dev), "cuCtxCreate")?;
-            let init_ctx_us = t0.elapsed().as_micros();
+        let t0 = Instant::now();
+        cu_check(ffi::cuInit(0), "cuInit")?;
+        let init_cuinit_us = t0.elapsed().as_micros();
 
-            let t0 = Instant::now();
-            let mut module: *mut () = std::ptr::null_mut();
-            // cuModuleLoadData expects a null-terminated image for PTX.
-            let mut image: Vec<u8> = Vec::with_capacity(ptx.len() + 1);
-            image.extend_from_slice(ptx);
-            image.push(0);
-            cu_check(ffi::cuModuleLoadData(&mut module, image.as_ptr()), "cuModuleLoadData")?;
-            let init_jit_us = t0.elapsed().as_micros();
+        let t0 = Instant::now();
+        let mut dev: i32 = 0;
+        cu_check(ffi::cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
+        let mut ctx: *mut ffi::Ctx = std::ptr::null_mut();
+        cu_check(ffi::cuCtxCreate(&mut ctx, 0, dev), "cuCtxCreate")?;
+        let init_ctx_us = t0.elapsed().as_micros();
 
-            let t0 = Instant::now();
-            let get = |name: &str| -> Result<*mut (), String> {
-                let mut f: *mut () = std::ptr::null_mut();
-                let cname = std::ffi::CString::new(name).unwrap();
-                cu_check(ffi::cuModuleGetFunction(&mut f, module, cname.as_ptr()), name)?;
-                Ok(f)
-            };
+        let t0 = Instant::now();
+        let mut module: *mut () = std::ptr::null_mut();
+        // cuModuleLoadData expects a null-terminated image for PTX.
+        let mut image: Vec<u8> = Vec::with_capacity(ptx.len() + 1);
+        image.extend_from_slice(ptx);
+        image.push(0);
+        cu_check(ffi::cuModuleLoadData(&mut module, image.as_ptr()), "cuModuleLoadData")?;
+        let init_jit_us = t0.elapsed().as_micros();
 
-            let f_reset = get("reset")?;
-            let f_h = get("apply_h")?;
-            let f_x = get("apply_x")?;
-            let f_cnot = get("apply_cnot")?;
-            let f_toff = get("apply_toff")?;
-            let f_prob = get("prob_partial")?;
-            let f_finalize = get("prob_finalize")?;
-            let f_collapse = get("collapse")?;
-            let f_rz = get("apply_rz")?;
-            let f_rx = get("apply_rx")?;
-            let f_ry = get("apply_ry")?;
-            let f_phase = get("apply_phase")?;
-            let f_s = get("apply_s")?;
-            let f_sdg = get("apply_sdg")?;
-            let f_t = get("apply_t")?;
-            let f_sx = get("apply_sx")?;
-            let f_swap = get("apply_swap")?;
-            let f_iswap = get("apply_iswap")?;
-            let f_cz = get("apply_cz")?;
-            let f_cphase = get("apply_cphase")?;
-            let f_cswap = get("apply_cswap")?;
-            let f_mcx = get("apply_mcx")?;
-            let f_mega = get("mega")?;
-            // Opt in to >48 KB dynamic shared memory so the mega kernel can
-            // hold states up to 2^14 amps (128 KB) in one block. CUDA's
-            // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8.
-            let _ = ffi::cuFuncSetAttribute(f_mega, 8, 64 * 1024);
-            let f_expect_partial = get("expect_partial")?;
-            let f_expect_finalize = get("expect_finalize")?;
+        let t0 = Instant::now();
+        let get = |name: &str| -> Result<*mut (), String> {
+            let mut f: *mut () = std::ptr::null_mut();
+            let cname = std::ffi::CString::new(name).unwrap();
+            cu_check(ffi::cuModuleGetFunction(&mut f, module, cname.as_ptr()), name)?;
+            Ok(f)
+        };
 
-            let mut ops_buf: u64 = 0;
-            cu_check(
-                ffi::cuMemAlloc(&mut ops_buf, (8 * 4 * plasma::ir::MAX_OPS) as u64),
-                "cuMemAlloc ops",
-            )?;
+        let f_reset = get("reset")?;
+        let f_h = get("apply_h")?;
+        let f_x = get("apply_x")?;
+        let f_cnot = get("apply_cnot")?;
+        let f_toff = get("apply_toff")?;
+        let f_prob = get("prob_partial")?;
+        let f_finalize = get("prob_finalize")?;
+        let f_collapse = get("collapse")?;
+        let f_rz = get("apply_rz")?;
+        let f_rx = get("apply_rx")?;
+        let f_ry = get("apply_ry")?;
+        let f_phase = get("apply_phase")?;
+        let f_s = get("apply_s")?;
+        let f_sdg = get("apply_sdg")?;
+        let f_t = get("apply_t")?;
+        let f_sx = get("apply_sx")?;
+        let f_swap = get("apply_swap")?;
+        let f_iswap = get("apply_iswap")?;
+        let f_cz = get("apply_cz")?;
+        let f_cphase = get("apply_cphase")?;
+        let f_cswap = get("apply_cswap")?;
+        let f_mcx = get("apply_mcx")?;
+        let f_mega = get("mega")?;
+        // Opt in to >48 KB dynamic shared memory so the mega kernel can
+        // hold states up to 2^14 amps (128 KB) in one block. CUDA's
+        // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8.
+        let _ = ffi::cuFuncSetAttribute(f_mega, 8, 64 * 1024);
+        let f_expect_partial = get("expect_partial")?;
+        let f_expect_finalize = get("expect_finalize")?;
 
-            let mut state_buf: u64 = 0;
-            cu_check(
-                ffi::cuMemAlloc(&mut state_buf, (8 * n) as u64),
-                "cuMemAlloc state",
-            )?;
-            // Zero the initial state so no execution path can depend on the
-            // driver's (unreliable) fresh-allocation contents.
-            cu_check(
-                ffi::cuMemsetD8(state_buf, 0, (8 * n) as u64),
-                "cuMemsetD8 state",
-            )?;
-            let mut prob_buf: u64 = 0;
-            cu_check(ffi::cuMemAlloc(&mut prob_buf, 4), "cuMemAlloc prob")?;
-            let nblocks = ((n as u32 + BLOCK - 1) / BLOCK).max(1);
-            let mut prob_scratch: u64 = 0;
-            cu_check(
-                ffi::cuMemAlloc(&mut prob_scratch, (8 * nblocks) as u64),
-                "cuMemAlloc prob scratch",
-            )?;
-            let mut expect_scratch: u64 = 0;
-            cu_check(
-                ffi::cuMemAlloc(&mut expect_scratch, (16 * nblocks) as u64),
-                "cuMemAlloc expect scratch",
-            )?;
-            let mut expect_out: u64 = 0;
-            cu_check(ffi::cuMemAlloc(&mut expect_out, 8), "cuMemAlloc expect out")?;
-            // Pinned staging buffer for fast async device->host transfers.
-            let mut pinned: *mut f32 = std::ptr::null_mut();
-            let mut pin_rc = 0;
-            if std::env::var("PLASMA_NO_PINNED").is_err() {
-                pin_rc = ffi::cuMemHostAlloc(
-                (&mut pinned as *mut *mut f32).cast(),
-                (8 * n) as u64,
-                0,
-                );
-            }
-            if pin_rc != 0 {
-                pinned = std::ptr::null_mut();
-            }
-            let init_alloc_us = t0.elapsed().as_micros();
+        let mut ops_buf: u64 = 0;
+        cu_check(
+            ffi::cuMemAlloc(&mut ops_buf, (8 * 4 * plasma::ir::MAX_OPS) as u64),
+            "cuMemAlloc ops",
+        )?;
 
-            // CUDA events for true GPU execution timing.
-            let mut ev_start: *mut () = std::ptr::null_mut();
-            let mut ev_stop: *mut () = std::ptr::null_mut();
-            cu_check(ffi::cuEventCreate(&mut ev_start, 0), "cuEventCreate start")?;
-            cu_check(ffi::cuEventCreate(&mut ev_stop, 0), "cuEventCreate stop")?;
-
-            Ok(Gpu {
-                ctx,
-                module,
-                f_reset,
-                f_h,
-                f_x,
-                f_cnot,
-                f_toff,
-                f_prob,
-                f_finalize,
-                f_collapse,
-                f_rz,
-                f_rx,
-                f_ry,
-                f_phase,
-                f_s,
-                f_sdg,
-                f_t,
-                f_sx,
-                f_swap,
-                f_iswap,
-                f_cz,
-                f_cphase,
-                f_cswap,
-                f_mcx,
-                f_mega,
-                ops_buf,
-                f_expect_partial,
-                f_expect_finalize,
-                expect_scratch,
-                expect_out,
-                pinned,
-                state_buf,
-                prob_buf,
-                prob_scratch,
-                nblocks,
-                n,
-                ev_start,
-                ev_stop,
-                exec_us: Cell::new(0),
-                exec_gpu_us: Cell::new(0),
-                transfer_us: Cell::new(0),
-                sample_us: Cell::new(0),
-                launches: Cell::new(0),
-                init_cuinit_us: Cell::new(init_cuinit_us),
-                init_ctx_us: Cell::new(init_ctx_us),
-                init_jit_us: Cell::new(init_jit_us),
-                init_alloc_us: Cell::new(init_alloc_us),
-            })
+        let mut state_buf: u64 = 0;
+        cu_check(
+            ffi::cuMemAlloc(&mut state_buf, (8 * n) as u64),
+            "cuMemAlloc state",
+        )?;
+        // Zero the initial state so no execution path can depend on the
+        // driver's (unreliable) fresh-allocation contents.
+        cu_check(
+            ffi::cuMemsetD8(state_buf, 0, (8 * n) as u64),
+            "cuMemsetD8 state",
+        )?;
+        let mut prob_buf: u64 = 0;
+        cu_check(ffi::cuMemAlloc(&mut prob_buf, 4), "cuMemAlloc prob")?;
+        let nblocks = ((n as u32 + BLOCK - 1) / BLOCK).max(1);
+        let mut prob_scratch: u64 = 0;
+        cu_check(
+            ffi::cuMemAlloc(&mut prob_scratch, (8 * nblocks) as u64),
+            "cuMemAlloc prob scratch",
+        )?;
+        let mut expect_scratch: u64 = 0;
+        cu_check(
+            ffi::cuMemAlloc(&mut expect_scratch, (16 * nblocks) as u64),
+            "cuMemAlloc expect scratch",
+        )?;
+        let mut expect_out: u64 = 0;
+        cu_check(ffi::cuMemAlloc(&mut expect_out, 8), "cuMemAlloc expect out")?;
+        // Pinned staging buffer for fast async device->host transfers.
+        let mut pinned: *mut f32 = std::ptr::null_mut();
+        let mut pin_rc = 0;
+        if std::env::var("PLASMA_NO_PINNED").is_err() {
+            pin_rc = ffi::cuMemHostAlloc(
+            (&mut pinned as *mut *mut f32).cast(),
+            (8 * n) as u64,
+            0,
+            );
         }
+        if pin_rc != 0 {
+            pinned = std::ptr::null_mut();
+        }
+        let init_alloc_us = t0.elapsed().as_micros();
+
+        // CUDA events for true GPU execution timing.
+        let mut ev_start: *mut () = std::ptr::null_mut();
+        let mut ev_stop: *mut () = std::ptr::null_mut();
+        cu_check(ffi::cuEventCreate(&mut ev_start, 0), "cuEventCreate start")?;
+        cu_check(ffi::cuEventCreate(&mut ev_stop, 0), "cuEventCreate stop")?;
+
+        Ok(Gpu {
+            ctx,
+            module,
+            f_reset,
+            f_h,
+            f_x,
+            f_cnot,
+            f_toff,
+            f_prob,
+            f_finalize,
+            f_collapse,
+            f_rz,
+            f_rx,
+            f_ry,
+            f_phase,
+            f_s,
+            f_sdg,
+            f_t,
+            f_sx,
+            f_swap,
+            f_iswap,
+            f_cz,
+            f_cphase,
+            f_cswap,
+            f_mcx,
+            f_mega,
+            ops_buf,
+            f_expect_partial,
+            f_expect_finalize,
+            expect_scratch,
+            expect_out,
+            pinned,
+            state_buf,
+            prob_buf,
+            prob_scratch,
+            nblocks,
+            n,
+            ev_start,
+            ev_stop,
+            exec_us: Cell::new(0),
+            exec_gpu_us: Cell::new(0),
+            transfer_us: Cell::new(0),
+            sample_us: Cell::new(0),
+            launches: Cell::new(0),
+            init_cuinit_us: Cell::new(init_cuinit_us),
+            init_ctx_us: Cell::new(init_ctx_us),
+            init_jit_us: Cell::new(init_jit_us),
+            init_alloc_us: Cell::new(init_alloc_us),
+        })
     }
 
     fn launch(&self, func: *mut (), args: &[&dyn KernelArg]) -> Result<(), String> {
@@ -371,25 +619,23 @@ impl Gpu {
         args: &[&dyn KernelArg],
     ) -> Result<(), String> {
         self.launches.set(self.launches.get() + 1);
-        unsafe {
-            let params: Vec<*const c_void> = args.iter().map(|a| a.as_ptr()).collect();
-            cu_check(
-                ffi::cuLaunchKernel(
-                    func,
-                    grid,
-                    1,
-                    1,
-                    block,
-                    1,
-                    1,
-                    0,
-                    std::ptr::null_mut(),
-                    params.as_ptr(),
-                    std::ptr::null(),
-                ),
-                "cuLaunchKernel",
-            )
-        }
+        let params: Vec<*const c_void> = args.iter().map(|a| a.as_ptr()).collect();
+        cu_check(
+            ffi::cuLaunchKernel(
+                func,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                params.as_ptr(),
+                std::ptr::null(),
+            ),
+            "cuLaunchKernel",
+        )
     }
 
     fn reset(&self) -> Result<(), String> {
@@ -577,12 +823,10 @@ impl Gpu {
             &[&self.expect_scratch, &self.nblocks, &self.expect_out],
         )?;
         let mut out = [0.0f32; 2];
-        unsafe {
-            cu_check(
-                ffi::cuMemcpyDtoH(out.as_mut_ptr().cast(), self.expect_out, 8),
-                "cuMemcpyDtoH expect",
-            )?;
-        }
+        cu_check(
+            ffi::cuMemcpyDtoH(out.as_mut_ptr().cast(), self.expect_out, 8),
+            "cuMemcpyDtoH expect",
+        )?;
         Ok(out[0] as f64)
     }
 
@@ -601,12 +845,10 @@ impl Gpu {
             &[&self.prob_scratch, &self.nblocks, &self.prob_buf],
         )?;
         let mut out = 0.0f32;
-        unsafe {
-            cu_check(
-                ffi::cuMemcpyDtoH((&mut out as *mut f32).cast(), self.prob_buf, 4),
-                "cuMemcpyDtoH prob",
-            )?;
-        }
+        cu_check(
+            ffi::cuMemcpyDtoH((&mut out as *mut f32).cast(), self.prob_buf, 4),
+            "cuMemcpyDtoH prob",
+        )?;
         Ok(out)
     }
 
@@ -630,18 +872,16 @@ impl Gpu {
     ) -> Result<&'a [f32], String> {
         let t0 = Instant::now();
         if !self.pinned.is_null() {
-            unsafe {
-                cu_check(
-                    ffi::cuMemcpyDtoHAsync(
-                        self.pinned.cast(),
-                        self.state_buf,
-                        (8 * self.n) as u64,
-                        std::ptr::null_mut(),
-                    ),
-                    "cuMemcpyDtoHAsync state",
-                )?;
-                cu_check(ffi::cuStreamSynchronize(std::ptr::null_mut()), "cuStreamSynchronize")?;
-            }
+            cu_check(
+                ffi::cuMemcpyDtoHAsync(
+                    self.pinned.cast(),
+                    self.state_buf,
+                    (8 * self.n) as u64,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyDtoHAsync state",
+            )?;
+            cu_check(ffi::cuStreamSynchronize(std::ptr::null_mut()), "cuStreamSynchronize")?;
             let sl = unsafe {
                 std::slice::from_raw_parts(self.pinned as *const f32, 2 * self.n)
             };
@@ -649,16 +889,14 @@ impl Gpu {
             Ok(sl)
         } else {
             scratch.resize(2 * self.n, 0.0);
-            unsafe {
-                cu_check(
-                    ffi::cuMemcpyDtoH(
-                        scratch.as_mut_ptr().cast(),
-                        self.state_buf,
-                        (8 * self.n) as u64,
-                    ),
-                    "cuMemcpyDtoH state",
-                )?;
-            }
+            cu_check(
+                ffi::cuMemcpyDtoH(
+                    scratch.as_mut_ptr().cast(),
+                    self.state_buf,
+                    (8 * self.n) as u64,
+                ),
+                "cuMemcpyDtoH state",
+            )?;
             self.transfer_us.set(self.transfer_us.get() + t0.elapsed().as_micros());
             Ok(scratch)
         }
@@ -897,49 +1135,43 @@ impl Gpu {
             return Ok(false);
         }
         let nops = (ops.len() / 8) as u32;
-        unsafe {
-            cu_check(
-                ffi::cuMemcpyHtoD(self.ops_buf, ops.as_ptr().cast(), (ops.len() * 4) as u64),
-                "cuMemcpyHtoD ops",
-            )?;
-        }
+        cu_check(
+            ffi::cuMemcpyHtoD(self.ops_buf, ops.as_ptr().cast(), (ops.len() * 4) as u64),
+            "cuMemcpyHtoD ops",
+        )?;
         let n = self.n as u32;
         let block = n.min(1024);
         let shared = (8 * self.n) as u32;
-        unsafe {
-            cu_check(ffi::cuEventRecord(self.ev_start, std::ptr::null_mut()), "cuEventRecord")?;
-            cu_check(
-                ffi::cuLaunchKernel(
-                    self.f_mega,
-                    1,
-                    1,
-                    1,
-                    block,
-                    1,
-                    1,
-                    shared,
-                    std::ptr::null_mut(),
-                    [&self.state_buf as *const u64 as *const std::ffi::c_void,
-                     &n as *const u32 as *const std::ffi::c_void,
-                     &self.ops_buf as *const u64 as *const std::ffi::c_void,
-                     &nops as *const u32 as *const std::ffi::c_void]
-                    .as_ptr(),
-                    std::ptr::null(),
-                ),
-                "cuLaunchKernel mega",
-            )?;
-        }
+        cu_check(ffi::cuEventRecord(self.ev_start, std::ptr::null_mut()), "cuEventRecord")?;
+        cu_check(
+            ffi::cuLaunchKernel(
+                self.f_mega,
+                1,
+                1,
+                1,
+                block,
+                1,
+                1,
+                shared,
+                std::ptr::null_mut(),
+                [&self.state_buf as *const u64 as *const std::ffi::c_void,
+                 &n as *const u32 as *const std::ffi::c_void,
+                 &self.ops_buf as *const u64 as *const std::ffi::c_void,
+                 &nops as *const u32 as *const std::ffi::c_void]
+                .as_ptr(),
+                std::ptr::null(),
+            ),
+            "cuLaunchKernel mega",
+        )?;
         self.launches.set(self.launches.get() + 1);
-        unsafe {
-            cu_check(ffi::cuEventRecord(self.ev_stop, std::ptr::null_mut()), "cuEventRecord")?;
-            cu_check(ffi::cuEventSynchronize(self.ev_stop), "cuEventSynchronize")?;
-            let mut ms: f32 = 0.0;
-            cu_check(
-                ffi::cuEventElapsedTime(&mut ms, self.ev_start, self.ev_stop),
-                "cuEventElapsedTime",
-            )?;
-            self.exec_gpu_us.set((ms * 1000.0) as u128);
-        }
+        cu_check(ffi::cuEventRecord(self.ev_stop, std::ptr::null_mut()), "cuEventRecord")?;
+        cu_check(ffi::cuEventSynchronize(self.ev_stop), "cuEventSynchronize")?;
+        let mut ms: f32 = 0.0;
+        cu_check(
+            ffi::cuEventElapsedTime(&mut ms, self.ev_start, self.ev_stop),
+            "cuEventElapsedTime",
+        )?;
+        self.exec_gpu_us.set((ms * 1000.0) as u128);
         // The state now holds the post-circuit state; sample host-side.
         let cum = self.transfer_cumulative()?;
         let t_samp = Instant::now();
@@ -1001,20 +1233,16 @@ impl Gpu {
         }
 
         self.reset()?;
-        unsafe {
-            cu_check(ffi::cuEventRecord(self.ev_start, std::ptr::null_mut()), "cuEventRecord")?;
-        }
+        cu_check(ffi::cuEventRecord(self.ev_start, std::ptr::null_mut()), "cuEventRecord")?;
         self.exec(prog, start, end, results, classical, histogram, rng, &[None; 3])?;
-        unsafe {
-            cu_check(ffi::cuEventRecord(self.ev_stop, std::ptr::null_mut()), "cuEventRecord")?;
-            cu_check(ffi::cuEventSynchronize(self.ev_stop), "cuEventSynchronize")?;
-            let mut ms: f32 = 0.0;
-            cu_check(
-                ffi::cuEventElapsedTime(&mut ms, self.ev_start, self.ev_stop),
-                "cuEventElapsedTime",
-            )?;
-            self.exec_gpu_us.set((ms * 1000.0) as u128);
-        }
+        cu_check(ffi::cuEventRecord(self.ev_stop, std::ptr::null_mut()), "cuEventRecord")?;
+        cu_check(ffi::cuEventSynchronize(self.ev_stop), "cuEventSynchronize")?;
+        let mut ms: f32 = 0.0;
+        cu_check(
+            ffi::cuEventElapsedTime(&mut ms, self.ev_start, self.ev_stop),
+            "cuEventElapsedTime",
+        )?;
+        self.exec_gpu_us.set((ms * 1000.0) as u128);
         let cum = self.transfer_cumulative()?;
         let t_samp = Instant::now();
         for _ in 0..samples {
@@ -1263,18 +1491,16 @@ impl Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
-        unsafe {
-            let _ = ffi::cuMemFree(self.state_buf);
-            let _ = ffi::cuMemFree(self.ops_buf);
-            if !self.pinned.is_null() {
-                let _ = ffi::cuMemFreeHost(self.pinned.cast());
-            }
-            let _ = ffi::cuMemFree(self.prob_buf);
-            let _ = ffi::cuMemFree(self.prob_scratch);
-            let _ = ffi::cuEventDestroy(self.ev_start);
-            let _ = ffi::cuEventDestroy(self.ev_stop);
-            let _ = ffi::cuModuleUnload(self.module);
-            let _ = ffi::cuCtxDestroy(self.ctx);
+        let _ = ffi::cuMemFree(self.state_buf);
+        let _ = ffi::cuMemFree(self.ops_buf);
+        if !self.pinned.is_null() {
+            let _ = ffi::cuMemFreeHost(self.pinned.cast());
         }
+        let _ = ffi::cuMemFree(self.prob_buf);
+        let _ = ffi::cuMemFree(self.prob_scratch);
+        let _ = ffi::cuEventDestroy(self.ev_start);
+        let _ = ffi::cuEventDestroy(self.ev_stop);
+        let _ = ffi::cuModuleUnload(self.module);
+        let _ = ffi::cuCtxDestroy(self.ctx);
     }
 }

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Faris Alfarhan
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Plasma correctness harness.
 
 Enforces the backward-compat invariants:

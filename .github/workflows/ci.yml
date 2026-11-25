@@ -1,0 +1,44 @@
+# Copyright (c) 2026 Faris Alfarhan
+# SPDX-License-Identifier: GPL-3.0-only
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  RUST_MIN_STACK: "16777216"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release
+        run: cargo build --release --locked
+      - name: Run tests
+        run: cargo test --locked
+      - name: CPU smoke checks
+        run: |
+          set -euo pipefail
+          ./target/release/plasma --version
+          ./target/release/plasma run tests/ghz3.qs0 --shots 100 --seed 123 > /tmp/run1.txt
+          ./target/release/plasma run tests/ghz3.qs0 --shots 100 --seed 123 > /tmp/run2.txt
+          diff -u /tmp/run1.txt /tmp/run2.txt
+          ./target/release/plasma run tests/four.qs0 --shots 100 --seed 123 > /dev/null
+          ./target/release/plasma run tests/toff.qs0 --shots 100 --seed 123 > /dev/null
+          ./target/release/plasma run tests/measure.qs0 --shots 100 --seed 123 > /dev/null
+      - name: GPU driver error
+        run: |
+          set -euo pipefail
+          if ldconfig -p | grep -q 'libcuda.so.1'; then
+            echo "CUDA driver present; skipping missing-driver check"
+            exit 0
+          fi
+          if ./target/release/plasma run tests/ghz3.qs0 --gpu > /tmp/gpu.out 2> /tmp/gpu.err; then
+            echo "expected --gpu to fail without libcuda"
+            exit 1
+          fi
+          grep -q "CUDA driver not found" /tmp/gpu.err

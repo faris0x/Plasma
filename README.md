@@ -101,14 +101,12 @@ Worked programs live in `examples/`, each with a step-by-step explanation:
 
 ### Operating system
 
-Linux (x86_64). The binary links the standard glibc libraries and the NVIDIA
-CUDA driver.
+Linux (x86_64). The binary links the standard glibc libraries.
 
 ### Runtime
 
-- **NVIDIA CUDA driver** (`libcuda.so.1`): required to load the binary, even
-  for CPU-only runs, because the GPU backend is always linked. CUDA is only
-  initialized when `--gpu` is used.
+- **NVIDIA CUDA driver** (`libcuda.so.1`): optional. It is loaded at runtime
+  only when `--gpu` is used. CPU-only runs work without it.
 - **No CUDA toolkit at runtime**: the GPU path loads hand-written PTX and the
   driver's embedded JIT compiles it for the actual GPU. No nvcc, NVRTC, or
   headers are needed on the target.
@@ -128,6 +126,6 @@ float math is hand-rolled.
 
 ### Build
 
-Rust toolchain (cargo/rustc, edition 2021), `libcuda` present to link against,
-and `git` for the branch/commit shown by `--version` (falls back to "unknown"
-if unavailable).
+Rust toolchain (cargo/rustc, edition 2021), and `git` for the branch/commit
+shown by `--version` (falls back to "unknown" if unavailable). The CUDA driver
+is loaded at runtime and is only required for `--gpu`.
